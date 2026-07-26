@@ -154,12 +154,18 @@ highest.
 
 **How to use it**
 0. Run a competition or require an assignment using the ASCE Bridge Designer, linked at bottom of this page. 
+
 1a. Students should use File > Print to access the PDF Elevation View rendering of their bridge. Ensure that they have applied their name in the app prior to printing. 
-1b. Have them submit those files to you via the most accessible medium. I prefer creating an assignment in Canvas that they submit to because it allows a mass download of all submissions. 
+
+1b. Have them submit those files to you via the most accessible medium. I prefer creating an assignment in Canvas that they submit to because it allows a mass download of all submissions.
+
 1c. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB**(one PDF per submission). 
+
 2. Click **Check and grade submissions**.
+
 3. Review the results: qualifying submissions are ranked and graded;
    disqualified submissions are listed separately.
+   
 4. Download the CSV, and review the chart.
 
 **Structural soundness check**
