@@ -153,6 +153,7 @@ cost**. Cheaper is better: the least expensive qualifying design scores
 highest.
 
 **How to use it**
+
 0. Run a competition or require an assignment using the ASCE Bridge Designer, linked at bottom of this page. 
 
 1a. Students should use File > Print to access the PDF Elevation View rendering of their bridge. Ensure that they have applied their name in the app prior to printing. 
