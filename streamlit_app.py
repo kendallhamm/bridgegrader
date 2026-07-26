@@ -165,7 +165,7 @@ highest.
 
 3. Review the results: qualifying submissions are ranked and graded;
    disqualified submissions are listed separately.
-   
+
 4. Download the CSV, and review the chart.
 
 **Structural soundness check**
@@ -258,7 +258,7 @@ if uploaded_files:
             for r in graded:
                 rows.append(
                     {
-                        "Rank": r["rank"],
+                        "Rank": int(r["rank"]),
                         "Name": r["name"],
                         "Cost": r["cost"],
                         "Recommended Grade": r["grade"],
