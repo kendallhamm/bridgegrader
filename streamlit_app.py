@@ -143,7 +143,7 @@ def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
 
 st.set_page_config(page_title="Bridge Cost Grading Tool", layout="wide")
 
-st.title("Bridge Cost Grading Tool")
+st.title("ASCE Bridge Designer App Grading Tool")
 
 st.markdown(
     f"""
@@ -153,7 +153,10 @@ cost**. Cheaper is better: the least expensive qualifying design scores
 highest.
 
 **How to use it**
-1. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB**(one PDF per submission).
+0. Run a competition or require an assignment using the ASCE Bridge Designer, linked at bottom of this page. 
+1a. Students should use File > Print to access the PDF Elevation View rendering of their bridge. Ensure that they have applied their name in the app prior to printing. 
+1b. Have them submit those files to you via the most accessible medium. I prefer creating an assignment in Canvas that they submit to because it allows a mass download of all submissions. 
+1c. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB**(one PDF per submission). 
 2. Click **Check and grade submissions**.
 3. Review the results: qualifying submissions are ranked and graded;
    disqualified submissions are listed separately.
@@ -407,6 +410,6 @@ with st.expander("Further Reading"):
         """
         - [ASCE Bridge Designer](https://www.asce.org/career-growth/pre-college-outreach/bridge-designer)
 
-        
+
         """
     )
