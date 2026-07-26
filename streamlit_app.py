@@ -122,7 +122,7 @@ def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
     c3 = records[2]["cost"]
 
     for i, r in enumerate(records, start=1):
-        r["rank"] = int(i)
+        r["rank"] = i
         if i == 1:
             r["grade"] = 100.0
         elif i in (2, 3):
@@ -280,7 +280,9 @@ if uploaded_files:
                     }
                 )
 
-            st.session_state["results_df"] = pd.DataFrame(rows)
+            results_df = pd.DataFrame(rows)
+            results_df["Rank"] = results_df["Rank"].astype("Int64")
+            st.session_state["results_df"] = results_df
 
 # ---------------------------------------------------------------------------
 # Results
@@ -292,7 +294,7 @@ if "results_df" in st.session_state:
 
     st.subheader("Results")
     st.dataframe(
-        df.style.format({"Cost": "${:,.2f}", "Recommended Grade": "{:.2f}"}, na_rep="-"),
+        df.style.format({"Cost": "${:,.2f}", "Recommended Grade": "{:.2f}", "Rank": "{:.0f}"}, na_rep="-"),
         use_container_width=True,
         hide_index=True,
     )
