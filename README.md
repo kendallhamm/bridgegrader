@@ -116,8 +116,8 @@ limit).
 
 ## Acknowledgments
 
-*Placeholder — to be filled in later.*
+Thanks to the development team for the ASCE Bridge Designer for helping us incorporate this grading program into the structure of the Plan Outputs from the designer. Also for adding a Structural Soundness check to the PDF upon our request!
 
 ## Further Reading
 
-*Placeholder — to be filled in later.*
+[ASCE Bridge Designer](https://www.asce.org/career-growth/pre-college-outreach/bridge-designer)
