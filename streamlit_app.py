@@ -122,7 +122,7 @@ def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
     c3 = records[2]["cost"]
 
     for i, r in enumerate(records, start=1):
-        r["rank"] = i
+        r["rank"] = int(i)
         if i == 1:
             r["grade"] = 100.0
         elif i in (2, 3):
@@ -258,7 +258,7 @@ if uploaded_files:
             for r in graded:
                 rows.append(
                     {
-                        "Rank": int(r["rank"]),
+                        "Rank": r["rank"],
                         "Name": r["name"],
                         "Cost": r["cost"],
                         "Recommended Grade": r["grade"],
