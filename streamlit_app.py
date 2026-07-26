@@ -279,27 +279,3 @@ if "results_df" in st.session_state:
         )
         st.altair_chart(chart, use_container_width=True)
 
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Placeholders for acknowledgments / further reading
-# ---------------------------------------------------------------------------
-
-with st.expander("Acknowledgments"):
-    st.markdown(
-        """
-        *Placeholder — add acknowledgments here.*
-
-        - [Contributor or organization name](https://example.com)
-        """
-    )
-
-with st.expander("Further Reading"):
-    st.markdown(
-        """
-        *Placeholder — add reference links here.*
-
-        - [Reference title](https://example.com)
-        - [Reference title](https://example.com)
-        """
-    )
