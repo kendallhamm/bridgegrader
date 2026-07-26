@@ -141,7 +141,7 @@ cost**. Cheaper is better: the least expensive qualifying design scores
 highest.
 
 **How to use it**
-1. Upload all PDF plan sheets for this round (one PDF per submission).
+1. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB** (one PDF per submission).
 2. Click **Check and grade submissions**.
 3. Review the results: qualifying submissions are ranked and graded;
    disqualified submissions are listed separately.
