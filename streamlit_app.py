@@ -25,6 +25,8 @@ import streamlit as st
 #   - The cost line always looks like "Cost: $xxx,xxx.xx Date: ... Iteration: N",
 #     so the dollar amount always ends right before "Date:".
 
+STRUCTURAL_FAIL_LOAD = "fails load test"
+STRUCTURAL_FAIL_ANALYSIS = "no valid analysis"
 STRUCTURAL_PASS_PHRASE = "passes all tests"
 
 
@@ -37,10 +39,26 @@ def get_line_value(text: str, label: str) -> str:
     return ""
 
 
-def has_line_containing(text: str, phrase: str) -> bool:
-    """True if any line contains phrase, case-insensitive."""
-    phrase = phrase.lower()
-    return any(phrase in line.lower() for line in text.splitlines())
+def classify_structural_status(text: str):
+    """Read the "Status:" line and classify it into GO/NO GO plus a note.
+
+    Returns (status, note):
+        "fails load test"   -> ("NO GO", "fails load test")
+        "no valid analysis" -> ("NO GO", "no valid analysis")
+        "passes all tests"  -> ("GO", "")
+        anything else / missing line -> ("NO GO", raw status text or "no status line found")
+    """
+    status_line = get_line_value(text, "Status")
+    lower = status_line.lower()
+
+    if STRUCTURAL_FAIL_LOAD in lower:
+        return "NO GO", STRUCTURAL_FAIL_LOAD
+    elif STRUCTURAL_FAIL_ANALYSIS in lower:
+        return "NO GO", STRUCTURAL_FAIL_ANALYSIS
+    elif STRUCTURAL_PASS_PHRASE in lower:
+        return "GO", ""
+    else:
+        return "NO GO", status_line or "no status line found"
 
 
 def extract_record(file_name: str, file_bytes: bytes):
@@ -66,10 +84,9 @@ def extract_record(file_name: str, file_bytes: bytes):
 
     name = get_line_value(text, "Designed by") or "Unknown"
 
-    structurally_sound = has_line_containing(text, STRUCTURAL_PASS_PHRASE)
-    status = "GO" if structurally_sound else "NO GO"
+    status, note = classify_structural_status(text)
 
-    return {"file": file_name, "name": name, "cost": cost, "status": status}
+    return {"file": file_name, "name": name, "cost": cost, "status": status, "note": note}
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +148,10 @@ highest.
 4. Download the CSV, and review the chart.
 
 **Structural soundness check**
-A submission is considered structurally sound if its plan sheet contains
-a line with the phrase **"{STRUCTURAL_PASS_PHRASE}"** (case-insensitive).
-A submission missing that line is disqualified (**NO GO**) and excluded
-from cost ranking, regardless of its price.
+Each plan sheet has a **"{STRUCTURAL_PASS_PHRASE}"**, **"{STRUCTURAL_FAIL_LOAD}"**,
+or **"{STRUCTURAL_FAIL_ANALYSIS}"** status line. Only submissions with a
+"{STRUCTURAL_PASS_PHRASE}" status are graded; the other two are excluded
+from cost ranking, and the reason is recorded in the CSV's Notes column.
 
 **Grading scale** (qualifying submissions only)
 | Rank | Grade |
@@ -183,9 +200,8 @@ if uploaded_files:
         if no_go_records:
             st.error(
                 "The following submission(s) failed the structural soundness "
-                f'check (no "{STRUCTURAL_PASS_PHRASE}" line found) and are '
-                "excluded from cost ranking:\n"
-                + "\n".join(f"- {r['name']} ({r['file']})" for r in no_go_records)
+                "check and are excluded from cost ranking:\n"
+                + "\n".join(f"- {r['name']} ({r['file']}): {r['note']}" for r in no_go_records)
             )
 
         if len(go_records) < 3:
@@ -206,6 +222,7 @@ if uploaded_files:
                         "Cost": r["cost"],
                         "Recommended Grade": r["grade"],
                         "Structural Status": "GO",
+                        "Notes": "",
                         "Source File": r["file"],
                     }
                 )
@@ -217,6 +234,7 @@ if uploaded_files:
                         "Cost": r["cost"],
                         "Recommended Grade": None,
                         "Structural Status": "NO GO",
+                        "Notes": r["note"],
                         "Source File": r["file"],
                     }
                 )
@@ -279,3 +297,27 @@ if "results_df" in st.session_state:
         )
         st.altair_chart(chart, use_container_width=True)
 
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Placeholders for acknowledgments / further reading
+# ---------------------------------------------------------------------------
+
+with st.expander("Acknowledgments"):
+    st.markdown(
+        """
+        *Placeholder — add acknowledgments here.*
+
+        - [Contributor or organization name](https://example.com)
+        """
+    )
+
+with st.expander("Further Reading"):
+    st.markdown(
+        """
+        *Placeholder — add reference links here.*
+
+        - [Reference title](https://example.com)
+        - [Reference title](https://example.com)
+        """
+    )
