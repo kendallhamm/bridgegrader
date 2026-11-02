@@ -6,6 +6,8 @@ soundness via a text check, extract the designer's name and submitted
 cost, rank and grade qualifying submissions, and export results.
 Also produces an order of merit list (OML) covering every parsed
 submission: GO submissions first by cost, then NO GO submissions by cost.
+If one person submits more than once, only their cheapest GO submission
+is kept (or their cheapest NO GO if none of theirs passed).
 
 Run locally with:
     streamlit run streamlit_app.py
@@ -98,6 +100,56 @@ def extract_record(file_name: str, file_bytes: bytes):
     status, note = classify_structural_status(text)
 
     return {"file": file_name, "name": name, "cost": cost, "status": status, "note": note}
+
+
+# ---------------------------------------------------------------------------
+# Duplicate submissions (same designer name)
+# ---------------------------------------------------------------------------
+
+def normalize_name(name: str) -> str:
+    """Lowercase and collapse whitespace so "Jane Doe" matches "jane  doe"."""
+    return " ".join(name.split()).lower()
+
+
+def dedupe_by_name(records: list[dict]):
+    """Keep one submission per designer name.
+
+    The kept submission is the cheapest GO submission for that name. If
+    none of that name's submissions are GO, the cheapest NO GO is kept.
+    Ties (same status and cost) keep the first one uploaded.
+
+    Names that are blank or "Unknown" are never merged, since they most
+    likely belong to different people who forgot to enter a name.
+
+    Returns (kept, dropped):
+        kept    -> records to grade/rank, in upload order
+        dropped -> list of (dropped_record, kept_record) pairs
+    """
+    def sort_key(r):
+        # GO beats NO GO; within the same status, cheaper wins.
+        return (0 if r["status"] == "GO" else 1, r["cost"])
+
+    # Pass 1: find the winning record for each name.
+    winners = {}
+    for r in records:
+        key = normalize_name(r["name"])
+        if key in ("", "unknown"):
+            continue
+        if key not in winners or sort_key(r) < sort_key(winners[key]):
+            winners[key] = r
+
+    # Pass 2: split into kept and dropped, pairing each dropped record with
+    # its name's final winner.
+    kept = []
+    dropped = []
+    for r in records:
+        key = normalize_name(r["name"])
+        if key in ("", "unknown") or winners[key] is r:
+            kept.append(r)
+        else:
+            dropped.append((r, winners[key]))
+
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +277,13 @@ from cost ranking, and the reason is recorded in the CSV's Notes column.
 The Status line may be on any page. NO GO submissions still appear at the
 bottom of the OML.
 
+**Duplicate submissions**
+If the same name appears on more than one submission, only that person's
+cheapest GO submission is kept. If none of their submissions passed, their
+cheapest NO GO is kept. Names are matched ignoring capitalization and extra
+spaces; "Unknown" names are never merged. Removed duplicates are listed in
+a warning and excluded from all results.
+
 **Grading scale** (qualifying submissions only)
 | Rank | Grade |
 |---|---|
@@ -274,11 +333,21 @@ if uploaded_files:
         no_go_records = []
         unparsed = []
 
+        parsed = []
+
         for f in uploaded_files:
             rec = extract_record(f.name, f.read())
             if rec is None:
                 unparsed.append(f.name)
-            elif rec["status"] == "GO":
+            else:
+                parsed.append(rec)
+
+        # Keep one submission per designer name before splitting GO/NO GO,
+        # so duplicates never reach grading, the OML, or either CSV.
+        parsed, duplicates = dedupe_by_name(parsed)
+
+        for rec in parsed:
+            if rec["status"] == "GO":
                 go_records.append(rec)
             else:
                 no_go_records.append(rec)
@@ -287,6 +356,20 @@ if uploaded_files:
             st.warning(
                 "Could not find a cost on the following file(s); they are "
                 "excluded entirely:\n" + "\n".join(f"- {name}" for name in unparsed)
+            )
+
+        if duplicates:
+            # "\\$" escapes the dollar sign so Streamlit does not render the
+            # text between two dollar amounts as LaTeX math.
+            st.warning(
+                "Multiple submissions were found for the same name. Only the "
+                "cheapest GO submission per name is kept (or the cheapest NO GO "
+                "if none passed). The following were removed:\n"
+                + "\n".join(
+                    f"- {d['file']} ({d['name']}, \\${d['cost']:,.2f}, {d['status']}): "
+                    f"kept {k['file']} (\\${k['cost']:,.2f}, {k['status']})"
+                    for d, k in duplicates
+                )
             )
 
         if no_go_records:

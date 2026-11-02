@@ -27,7 +27,9 @@ parsed submission, with its own CSV export.
    - **"fails load test"** → disqualified (**NO GO**), excluded from ranking, Notes column records `fails load test`.
    - **"no valid analysis"** → disqualified (**NO GO**), excluded from ranking, Notes column records `no valid analysis`.
    - Anything else (or a missing Status line) → treated as disqualified (**NO GO**) as a safe default, with the raw status text (or "no status line found") recorded in Notes.
-4. Qualifying (**GO**) submissions are ranked cheapest to most expensive
+4. If the same designer name appears on more than one submission, only
+   one is kept (see "Duplicate submissions" below).
+5. Qualifying (**GO**) submissions are ranked cheapest to most expensive
    and graded:
 
    | Rank | Grade |
@@ -79,12 +81,12 @@ parsed submission, with its own CSV export.
    c_3 scores 96; a bid priced P percent or more above c_3 scores 80;
    bids in between scale linearly.
 
-5. Results are shown in one combined table (qualifying submissions ranked
+6. Results are shown in one combined table (qualifying submissions ranked
    and graded, disqualified submissions listed with no rank/grade but a
    Notes explanation), exportable as CSV, plus two charts of qualifying
    submissions: cost vs. grade, and cost vs. rank. Both charts can also be
    downloaded as PNG files.
-6. An order of merit list is shown in a separate table and exported as
+7. An order of merit list is shown in a separate table and exported as
    `bridge_oml.csv` (see below).
 
 ## Order of merit list (OML)
@@ -105,6 +107,22 @@ results.
 
 The OML does not depend on grading, so it is produced even when fewer
 than 3 submissions are GO.
+
+## Duplicate submissions
+
+If the same designer name appears on more than one submission:
+
+- The person's **cheapest GO** submission is kept.
+- If none of their submissions are GO, their **cheapest NO GO** is kept.
+- If two candidates have the same status and cost, the first one uploaded
+  is kept.
+- Names are matched ignoring capitalization and extra spaces, so
+  "Jane Doe" and "jane  doe" are the same person.
+- Blank or "Unknown" names are never merged.
+
+Removed duplicates are listed in a warning (file, name, cost, status, and
+which file was kept instead) and are excluded from the graded table, the
+OML, and both CSVs.
 
 ## Structural soundness check
 
