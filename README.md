@@ -5,8 +5,9 @@ for structural soundness, then grades qualifying submissions by submitted
 cost. Upload the PDF plan sheets for a round; the app extracts each
 design's cost and designer name, disqualifies any submission that fails
 the soundness check, ranks the rest, assigns a recommended grade, and lets
-you export the results as a CSV alongside two charts, each downloadable
-as PNG.
+you export the results as a CSV alongside a chart. It also produces a
+separate order of merit list (OML) of every parsed submission, with its
+own CSV export.
 
 > **Note:** the grading formula below is written in LaTeX. It renders on
 > GitHub, GitLab, and most Markdown previewers with math support (e.g.
@@ -15,16 +16,15 @@ as PNG.
 
 ## What it does
 
-1. Upload any number of PDF plan sheets (one per submission).
-2. For each PDF, the app reads the first page and pulls:
+1. Upload any number of PDF plan sheets (one PDF per submission). A
+   submission may be more than one page.
+2. For each PDF, the app reads all pages (joined in page order) and pulls:
    - **Cost** — from a line like `Cost: $401,521.91 Date: 22 July 2026 Iteration: 6`
    - **Designer name** — from a line like `Designed by: John Smith`
-3. Each PDF has a **"Status:"** line on the plan sheet. Based on its
-   content:
-   - **"passes all tests"** → qualifying (**GO**), included in ranking, no note.
-   - **"fails load test"** → disqualified (**NO GO**), excluded from ranking, Notes column records `fails load test`.
-   - **"no valid analysis"** → disqualified (**NO GO**), excluded from ranking, Notes column records `no valid analysis`.
-   - Anything else (or a missing Status line) → treated as disqualified (**NO GO**) as a safe default, with the raw status text (or "no status line found") recorded in Notes.
+3. Each PDF is checked for a line containing the phrase **"passes all
+   tests"** (case-insensitive, anywhere on the line, on any page).
+   Submissions without that line are marked **NO GO** and excluded from
+   ranking and grading, regardless of cost.
 4. Qualifying (**GO**) submissions are ranked cheapest to most expensive
    and graded:
 
@@ -32,95 +32,104 @@ as PNG.
    |---|---|
    | 1st cheapest | 100 |
    | 2nd and 3rd cheapest | 97 |
-   | 4th cheapest through most expensive | 96 down to 80, scaled by % more expensive than the 3rd-cheapest bid |
+   | 4th cheapest through most expensive | scaled 96 down to 80, by cost value (linear interpolation, not by rank) |
 
-   For the 4th-cheapest submission and beyond, the grade is based on how
-   much more expensive the bid is than the 3rd-cheapest bid, **as a
-   percentage** — not on where it happens to fall in this particular
-   batch's min-max range. A configurable "grading sensitivity" setting
-   (in the app) controls how large that percentage premium needs to be
-   before a bid hits the floor of 80. This matters because a batch of,
-   say, 50 submissions might have costs tightly clustered within 1-2% of
-   each other, or spread across a much wider range — a plain min-max
-   stretch would always force someone down to 80 and someone up to 96
-   regardless of which situation you're in, which can penalize a tightly
-   clustered batch much more harshly than the actual cost differences
-   justify. Percentage-based grading means a batch with little real cost
-   spread stays clustered near 96, while a batch with wide spread still
-   uses the full 80-96 range.
+   Formally, let $c_1 < c_2 < \dots < c_n$ be the sorted costs of the $n$
+   qualifying submissions, with $c_3$ the 3rd-cheapest cost and $c_n$ the
+   most expensive. The grade $G(c_i)$ assigned to the submission with cost
+   $c_i$ is:
 
    $$
    G(c_i) =
    \begin{cases}
    100 & i = 1 \\[4pt]
    97 & i \in \{2, 3\} \\[4pt]
-   96 - \min\!\left(\dfrac{p_i}{P},\ 1\right) \left(96 - 80\right) & i > 3
+   96 - \dfrac{c_i - c_3}{c_n - c_3} \left(96 - 80\right) & i > 3
    \end{cases}
-   \qquad \text{where } p_i = \dfrac{c_i - c_3}{c_3} \times 100
    $$
 
    Plain text equivalent:
 
    ```
-   grade(c_i) = 100                                          if i = 1
-   grade(c_i) = 97                                           if i = 2 or i = 3
-   grade(c_i) = 96 - min(p_i / P, 1) * (96 - 80)             if i > 3
-
-   where:
-     p_i = (c_i - c_3) / c_3 * 100    (% premium over the 3rd-cheapest cost)
-     P   = the "grading sensitivity" setting (default 20): the premium
-           percentage at which a bid hits the floor grade of 80
+   grade(c_i) = 100                                         if i = 1
+   grade(c_i) = 97                                          if i = 2 or i = 3
+   grade(c_i) = 96 - (c_i - c_3) / (c_n - c_3) * (96 - 80)   if i > 3
    ```
 
    where c_1 < c_2 < ... < c_n are the sorted costs of the n qualifying
-   submissions and c_3 is the 3rd-cheapest cost. A bid priced exactly at
-   c_3 scores 96; a bid priced P percent or more above c_3 scores 80;
-   bids in between scale linearly.
+   submissions, c_3 is the 3rd-cheapest cost, and c_n is the most
+   expensive cost.
+
+   For $i > 3$, the grade is a linear interpolation **by cost value**
+   (not by rank position): it equals 96 when $c_i = c_3$, decreases
+   linearly to 80 when $c_i = c_n$, and is unaffected by how many
+   submissions fall between them. If $c_n = c_3$ (all remaining costs are
+   identical), every submission with $i > 3$ receives a grade of 96.
 
 5. Results are shown in one combined table (qualifying submissions ranked
-   and graded, disqualified submissions listed with no rank/grade but a
-   Notes explanation), exportable as CSV, plus two charts of qualifying
-   submissions: cost vs. grade, and cost vs. rank. Both charts can also be
-   downloaded as PNG files.
+   and graded, disqualified submissions listed with no rank/grade),
+   exportable as CSV, plus a cost-vs-grade scatter chart of qualifying
+   submissions only.
+6. An order of merit list is shown in a separate table and exported as
+   `bridge_oml.csv` (see below).
+
+## Order of merit list (OML)
+
+The OML ranks every successfully parsed submission:
+
+- **GO** submissions first, cheapest to most expensive.
+- **NO GO** submissions after all GO submissions, also cheapest to most
+  expensive.
+- Positions run continuously from 1 through N across both groups.
+- Ties in cost keep upload order.
+- No grades are shown on the OML.
+- Unparsed files (no readable cost) are not included.
+
+Columns: `OML Position`, `Name`, `Cost`, `Structural Status`,
+`Source File`.
+
+The OML does not depend on grading, so it is produced even when fewer
+than 3 submissions are GO.
 
 ## Structural soundness check
 
-Each plan sheet carries a "Status:" line recording the result of a
-structural analysis performed elsewhere. This app reads that line and
-classifies it into three outcomes:
-
-| Status line contains | Result | Notes column |
-|---|---|---|
-| "passes all tests" | GO — graded and ranked | (empty) |
-| "fails load test" | NO GO — excluded from ranking | `fails load test` |
-| "no valid analysis" | NO GO — excluded from ranking | `no valid analysis` |
-| anything else / missing | NO GO (safe default) — excluded from ranking | the raw status text, or `no status line found` |
-
-This is a simple text match, not an independent engineering analysis. If
-the wording of any status changes, update the phrase constants
-(`STRUCTURAL_PASS_PHRASE`, `STRUCTURAL_FAIL_LOAD`,
-`STRUCTURAL_FAIL_ANALYSIS`) near the top of `streamlit_app.py`.
+Every submission is assumed to have already been checked for structural
+soundness elsewhere; this app just looks for that result recorded on the
+plan sheet as a line containing "passes all tests". This is a simple text
+match, not an independent engineering analysis — if the phrase or
+wording convention changes, update `STRUCTURAL_PASS_PHRASE` near the top
+of `streamlit_app.py`.
 
 ## Extraction method
 
 Field extraction uses plain string splitting, not regex, since the plan
 sheets follow a fixed template:
 
+- Text from all pages of the PDF is joined in page order before
+  searching, so a submission that spans two or more pages is read as one
+  plan sheet. If a label appears more than once, the first occurrence
+  (earliest page) is used.
 - Each field sits on its own `Label: value` line.
+- The cost line is matched by the label `Cost:` (with the colon), so a
+  heading such as "Cost Summary" is not mistaken for it.
 - The cost is always the token between `$` and the following `Date:` on
   that line.
-- The structural status comes from the "Status:" line, matched
-  case-insensitively against the three known phrases above.
+- The structural check looks for a line containing "passes all tests"
+  anywhere in the extracted text (case-insensitive).
 
 If a PDF doesn't match this template (missing "Cost:" line, or a cost that
 doesn't parse as a number), the app excludes it entirely and lists it by
 filename as unparsed, rather than silently dropping or guessing it.
 
+Each PDF is treated as one submission. If one design were split across
+two separate PDF files, the app would treat them as two submissions.
+
 ## Requirements
 
-- At least 3 successfully parsed submissions (the top-3 tiers require 3
-  estimates to define). Below that, the app reports the shortfall and does
-  not produce a graded table.
+- At least 3 GO submissions to produce the graded table (the top-3 tiers
+  require 3 estimates to define). Below that, the app reports the
+  shortfall and does not produce a graded table. The OML is still
+  produced.
 
 ## Running locally
 
@@ -140,8 +149,8 @@ limit).
 
 ## Acknowledgments
 
-Thanks to the development team for the ASCE Bridge Designer for helping us incorporate this grading program into the structure of the Plan Outputs from the designer. Also for adding a Structural Soundness check to the PDF upon our request!
+*Placeholder — to be filled in later.*
 
 ## Further Reading
 
-[ASCE Bridge Designer](https://www.asce.org/career-growth/pre-college-outreach/bridge-designer)
+*Placeholder — to be filled in later.*
