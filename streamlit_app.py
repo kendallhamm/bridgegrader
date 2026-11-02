@@ -30,6 +30,8 @@ import streamlit as st
 #     joined in page order before searching, so the first matching line
 #     (earliest page) wins when a label appears more than once.
 
+STRUCTURAL_FAIL_LOAD = "fails load test"
+STRUCTURAL_FAIL_ANALYSIS = "no valid analysis"
 STRUCTURAL_PASS_PHRASE = "passes all tests"
 
 
@@ -42,10 +44,26 @@ def get_line_value(text: str, label: str) -> str:
     return ""
 
 
-def has_line_containing(text: str, phrase: str) -> bool:
-    """True if any line contains phrase, case-insensitive."""
-    phrase = phrase.lower()
-    return any(phrase in line.lower() for line in text.splitlines())
+def classify_structural_status(text: str):
+    """Read the "Status:" line and classify it into GO/NO GO plus a note.
+
+    Returns (status, note):
+        "fails load test"   -> ("NO GO", "fails load test")
+        "no valid analysis" -> ("NO GO", "no valid analysis")
+        "passes all tests"  -> ("GO", "")
+        anything else / missing line -> ("NO GO", raw status text or "no status line found")
+    """
+    status_line = get_line_value(text, "Status")
+    lower = status_line.lower()
+
+    if STRUCTURAL_FAIL_LOAD in lower:
+        return "NO GO", STRUCTURAL_FAIL_LOAD
+    elif STRUCTURAL_FAIL_ANALYSIS in lower:
+        return "NO GO", STRUCTURAL_FAIL_ANALYSIS
+    elif STRUCTURAL_PASS_PHRASE in lower:
+        return "GO", ""
+    else:
+        return "NO GO", status_line or "no status line found"
 
 
 def extract_record(file_name: str, file_bytes: bytes):
@@ -59,7 +77,7 @@ def extract_record(file_name: str, file_bytes: bytes):
     the user as unparsed rather than silently skipped).
     """
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        # Join all pages so fields or the pass phrase on page 2+ are found.
+        # Join all pages so fields or the Status line on page 2+ are found.
         text = "\n".join((page.extract_text() or "") for page in pdf.pages)
 
     # Label includes the colon so headings like "Cost Summary" on a later
@@ -77,33 +95,42 @@ def extract_record(file_name: str, file_bytes: bytes):
 
     name = get_line_value(text, "Designed by") or "Unknown"
 
-    structurally_sound = has_line_containing(text, STRUCTURAL_PASS_PHRASE)
-    status = "GO" if structurally_sound else "NO GO"
+    status, note = classify_structural_status(text)
 
-    return {"file": file_name, "name": name, "cost": cost, "status": status}
+    return {"file": file_name, "name": name, "cost": cost, "status": status, "note": note}
 
 
 # ---------------------------------------------------------------------------
 # Grading
 # ---------------------------------------------------------------------------
 
-def grade(records: list[dict]) -> list[dict]:
+def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
     """Sort ascending by cost and assign grades to GO (qualifying) submissions.
 
     Rank 1 (cheapest):  100
     Ranks 2-3:            97
-    Ranks 4-N: linear interpolation BY COST VALUE, anchored between
-               rank-3's cost (96) and the most expensive cost (80):
+    Ranks 4-N: graded on how much more expensive the bid is than the
+               3rd-cheapest (c3), as a percentage, not on where it falls
+               in the batch's min-max range. This avoids stretching a
+               tightly clustered batch across the full 96-80 point range
+               just because someone has to be "most expensive."
 
-        grade(c) = 96 - (c - c3) / (c_max - c3) * (96 - 80)
+        premium_pct = (cost - c3) / c3 * 100
+        grade = 96 - min(premium_pct / full_penalty_pct, 1.0) * (96 - 80)
+
+    A bid priced at c3 scores 96. A bid priced full_penalty_pct percent
+    (or more) above c3 scores the floor of 80. Bids in between scale
+    linearly. If the batch's actual spread never reaches full_penalty_pct,
+    nobody hits 80 — scores stay clustered near 96, proportional to how
+    close costs actually are.
     """
     if len(records) < 3:
         raise ValueError("Need at least 3 qualifying submissions to grade (top-3 tiers require 3).")
+    if full_penalty_pct <= 0:
+        raise ValueError("full_penalty_pct must be greater than 0.")
 
     records = sorted(records, key=lambda r: r["cost"])
     c3 = records[2]["cost"]
-    c_max = records[-1]["cost"]
-    span = c_max - c3
 
     for i, r in enumerate(records, start=1):
         r["rank"] = i
@@ -111,10 +138,12 @@ def grade(records: list[dict]) -> list[dict]:
             r["grade"] = 100.0
         elif i in (2, 3):
             r["grade"] = 97.0
-        elif span == 0:
-            r["grade"] = 96.0  # all remaining costs identical
+        elif c3 == 0:
+            r["grade"] = 80.0  # degenerate case: can't compute a percentage premium over $0
         else:
-            r["grade"] = round(96.0 - (r["cost"] - c3) / span * (96.0 - 80.0), 2)
+            premium_pct = (r["cost"] - c3) / c3 * 100.0
+            fraction = min(max(premium_pct / full_penalty_pct, 0.0), 1.0)
+            r["grade"] = round(96.0 - fraction * (96.0 - 80.0), 2)
 
     return records
 
@@ -131,7 +160,8 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
     continuously from 1 through N across both groups. Ties in cost keep
     upload order (Python's sort is stable). No grades are assigned here;
     grading is handled separately by grade() and needs at least 3 GO
-    submissions, while the OML does not.
+    submissions, while the OML does not. The Notes column carries the
+    NO GO reason from classify_structural_status().
     """
     go_sorted = sorted(go_records, key=lambda r: r["cost"])
     no_go_sorted = sorted(no_go_records, key=lambda r: r["cost"])
@@ -144,6 +174,7 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
                 "Name": r["name"],
                 "Cost": r["cost"],
                 "Structural Status": r["status"],
+                "Notes": r["note"],
                 "Source File": r["file"],
             }
         )
@@ -156,7 +187,7 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
 
 st.set_page_config(page_title="Bridge Cost Grading Tool", layout="wide")
 
-st.title("Bridge Cost Grading Tool")
+st.title("ASCE Bridge Designer App Grading Tool")
 
 st.markdown(
     f"""
@@ -167,30 +198,61 @@ highest. It also produces an **order of merit list (OML)** of all
 submissions.
 
 **How to use it**
-1. Upload all PDF plan sheets for this round (one PDF per submission;
-   a submission may be more than one page).
+
+0. Run a competition or require an assignment using the ASCE Bridge Designer, linked at bottom of this page. 
+
+1a. Students should use File > Print to access the PDF Elevation View rendering of their bridge. Ensure that they have applied their name in the app prior to printing. 
+
+1b. Have them submit those files to you via the most accessible medium. I prefer creating an assignment in Canvas that they submit to because it allows a mass download of all submissions.
+
+1c. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB**(one PDF per submission; a submission may be more than one page). 
+
 2. Click **Check and grade submissions**.
+
 3. Review the results: qualifying submissions are ranked and graded;
    disqualified submissions are listed separately.
+
 4. Download the CSV, and review the chart.
+
 5. Review and download the OML, which ranks every submission: GO
    submissions first by cost, then NO GO submissions by cost.
 
 **Structural soundness check**
-A submission is considered structurally sound if its plan sheet contains
-a line with the phrase **"{STRUCTURAL_PASS_PHRASE}"** (case-insensitive)
-on any page. A submission missing that line is disqualified (**NO GO**)
-and excluded from cost ranking and grading, regardless of its price. It
-still appears at the bottom of the OML.
+Each plan sheet has a **"{STRUCTURAL_PASS_PHRASE}"**, **"{STRUCTURAL_FAIL_LOAD}"**,
+or **"{STRUCTURAL_FAIL_ANALYSIS}"** status line. Only submissions with a
+"{STRUCTURAL_PASS_PHRASE}" status are graded; the other two are excluded
+from cost ranking, and the reason is recorded in the CSV's Notes column.
+The Status line may be on any page. NO GO submissions still appear at the
+bottom of the OML.
 
 **Grading scale** (qualifying submissions only)
 | Rank | Grade |
 |---|---|
 | 1st cheapest | 100 |
 | 2nd & 3rd cheapest | 97 |
-| 4th cheapest ... most expensive | scaled 96 down to 80, by cost value (not by rank) |
+| 4th cheapest ... most expensive | 96 down to 80, scaled by % more expensive than the 3rd-cheapest bid (not by min-max stretch) — see "Grading sensitivity" below |
 """
 )
+
+st.divider()
+
+with st.expander("Grading sensitivity (advanced)"):
+    st.caption(
+        "Controls how quickly cost above the 3rd-cheapest bid costs grade "
+        "points. A bid priced at the 3rd-cheapest cost scores 96; a bid "
+        "priced this percentage (or more) above it scores the floor of 80. "
+        "If your batch's actual cost spread never reaches this percentage, "
+        "nobody hits 80. Scores stay clustered near 96, proportional to "
+        "how close costs actually are. Increase this if scores are "
+        "spreading too widely for tightly clustered costs; decrease it if "
+        "you want cost differences to matter more."
+    )
+    full_penalty_pct = st.number_input(
+        "Cost premium (%) above 3rd-cheapest that earns the grade floor of 80",
+        min_value=0.1,
+        value=20.0,
+        step=1.0,
+    )
 
 st.divider()
 
@@ -230,9 +292,8 @@ if uploaded_files:
         if no_go_records:
             st.error(
                 "The following submission(s) failed the structural soundness "
-                f'check (no "{STRUCTURAL_PASS_PHRASE}" line found) and are '
-                "excluded from cost ranking:\n"
-                + "\n".join(f"- {r['name']} ({r['file']})" for r in no_go_records)
+                "check and are excluded from cost ranking:\n"
+                + "\n".join(f"- {r['name']} ({r['file']}): {r['note']}" for r in no_go_records)
             )
 
         # The OML covers every parsed submission and does not depend on
@@ -252,7 +313,7 @@ if uploaded_files:
                 st.info("The order of merit list is still produced below.")
             st.session_state.pop("results_df", None)
         else:
-            graded = grade(go_records)
+            graded = grade(go_records, full_penalty_pct=full_penalty_pct)
 
             rows = []
             for r in graded:
@@ -263,6 +324,7 @@ if uploaded_files:
                         "Cost": r["cost"],
                         "Recommended Grade": r["grade"],
                         "Structural Status": "GO",
+                        "Notes": "",
                         "Source File": r["file"],
                     }
                 )
@@ -274,11 +336,14 @@ if uploaded_files:
                         "Cost": r["cost"],
                         "Recommended Grade": None,
                         "Structural Status": "NO GO",
+                        "Notes": r["note"],
                         "Source File": r["file"],
                     }
                 )
 
-            st.session_state["results_df"] = pd.DataFrame(rows)
+            results_df = pd.DataFrame(rows)
+            results_df["Rank"] = results_df["Rank"].astype("Int64")
+            st.session_state["results_df"] = results_df
 
 # ---------------------------------------------------------------------------
 # Results
@@ -290,7 +355,7 @@ if "results_df" in st.session_state:
 
     st.subheader("Results")
     st.dataframe(
-        df.style.format({"Cost": "${:,.2f}", "Recommended Grade": "{:.2f}"}, na_rep="-"),
+        df.style.format({"Cost": "${:,.2f}", "Recommended Grade": "{:.2f}", "Rank": "{:.0f}"}, na_rep="-"),
         use_container_width=True,
         hide_index=True,
     )
@@ -306,7 +371,7 @@ if "results_df" in st.session_state:
     if not graded_df.empty:
         st.subheader("Cost vs. Grade (qualifying submissions)")
         st.caption(
-            "Scatter plot recommended over a bar chart here: grading is a "
+            "Grading is a "
             "continuous function of cost (not of rank), so a scatter plot "
             "makes the linear interpolation between rank 3 and the most "
             "expensive bid visible directly, and makes it easy to spot "
@@ -336,6 +401,66 @@ if "results_df" in st.session_state:
         )
         st.altair_chart(chart, use_container_width=True)
 
+        try:
+            grade_chart_png = chart.to_image(format="png", scale=2)
+            st.download_button(
+                "Download this chart as PNG",
+                data=grade_chart_png,
+                file_name="cost_vs_grade.png",
+                mime="image/png",
+                key="download_grade_chart_png",
+            )
+        except Exception as e:
+            st.caption(
+                f"PNG export unavailable ({e}). Make sure vl-convert-python "
+                "is installed (see requirements.txt)."
+            )
+
+        st.subheader("Cost vs. Rank (qualifying submissions)")
+        st.caption(
+            "Rank 1 (cheapest) is plotted at the top. This view makes it "
+            "easy to see how tightly or loosely spaced the actual costs "
+            "are between consecutive ranks — e.g. whether rank 1 and rank "
+            "2 are nearly tied in cost or far apart."
+        )
+
+        rank_chart = (
+            alt.Chart(graded_df)
+            .mark_circle(size=110)
+            .encode(
+                x=alt.X("Cost:Q", title="Submitted Cost ($)", axis=alt.Axis(format="$,.0f")),
+                y=alt.Y(
+                    "Rank:O",
+                    title="Rank",
+                    sort=alt.SortField(field="Rank", order="ascending"),
+                ),
+                color=alt.Color(
+                    "Recommended Grade:Q",
+                    scale=alt.Scale(scheme="redyellowgreen", domain=[80, 100]),
+                    legend=alt.Legend(title="Grade"),
+                ),
+                tooltip=["Rank", "Name", alt.Tooltip("Cost:Q", format="$,.2f"), "Recommended Grade"],
+            )
+            .properties(height=420)
+            .interactive()
+        )
+        st.altair_chart(rank_chart, use_container_width=True)
+
+        try:
+            rank_chart_png = rank_chart.to_image(format="png", scale=2)
+            st.download_button(
+                "Download this chart as PNG",
+                data=rank_chart_png,
+                file_name="cost_vs_rank.png",
+                mime="image/png",
+                key="download_rank_chart_png",
+            )
+        except Exception as e:
+            st.caption(
+                f"PNG export unavailable ({e}). Make sure vl-convert-python "
+                "is installed (see requirements.txt)."
+            )
+
 # ---------------------------------------------------------------------------
 # Order of merit list (shown independently of grading)
 # ---------------------------------------------------------------------------
@@ -361,6 +486,7 @@ if "oml_df" in st.session_state:
         data=oml_csv_bytes,
         file_name="bridge_oml.csv",
         mime="text/csv",
+        key="download_oml_csv",
     )
 
 st.divider()
@@ -372,18 +498,15 @@ st.divider()
 with st.expander("Acknowledgments"):
     st.markdown(
         """
-        *Placeholder — add acknowledgments here.*
-
-        - [Contributor or organization name](https://example.com)
+        Thanks to the development team of the ASCE Bridge Designer for adding a feature to enable this app!
         """
     )
 
 with st.expander("Further Reading"):
     st.markdown(
         """
-        *Placeholder — add reference links here.*
+        - [ASCE Bridge Designer](https://www.asce.org/career-growth/pre-college-outreach/bridge-designer)
 
-        - [Reference title](https://example.com)
-        - [Reference title](https://example.com)
+
         """
     )
