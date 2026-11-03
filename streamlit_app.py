@@ -296,6 +296,136 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Results assembly (shared by the PDF mode and the saved-OML mode)
+# ---------------------------------------------------------------------------
+
+def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], full_penalty_pct: float) -> None:
+    """Build the OML and the graded results table and store both in
+    st.session_state ("oml_df", "results_df"). Shows the fewer-than-3-GO
+    error when grading is not possible. Used by both input modes so they
+    always produce identical tables and CSVs.
+    """
+    # The OML covers every parsed submission and does not depend on
+    # grading, so it is built even when fewer than 3 are GO. It is
+    # built before grade() runs, from the same parsed records.
+    if go_records or no_go_records:
+        st.session_state["oml_df"] = pd.DataFrame(build_oml(go_records, no_go_records))
+    else:
+        st.session_state.pop("oml_df", None)
+
+    if len(go_records) < 3:
+        st.error(
+            f"Only {len(go_records)} qualifying submission(s) found. "
+            "At least 3 are required to grade (the top-3 tiers need 3 estimates)."
+        )
+        if go_records or no_go_records:
+            st.info("The order of merit list is still produced below.")
+        st.session_state.pop("results_df", None)
+    else:
+        graded = grade(go_records, full_penalty_pct=full_penalty_pct)
+
+        rows = []
+        for r in graded:
+            rows.append(
+                {
+                    "Rank": r["rank"],
+                    "Name": r["name"],
+                    "Cost": r["cost"],
+                    "Recommended Grade": r["grade"],
+                    "Structural Status": "GO",
+                    # Empty for PDF-parsed GO submissions; "manually
+                    # entered" for rows from the manual entry table.
+                    "Notes": r["note"],
+                    "Source File": r["file"],
+                }
+            )
+        for r in no_go_records:
+            rows.append(
+                {
+                    "Rank": None,
+                    "Name": r["name"],
+                    "Cost": r["cost"],
+                    "Recommended Grade": None,
+                    "Structural Status": "NO GO",
+                    "Notes": r["note"],
+                    "Source File": r["file"],
+                }
+            )
+
+        results_df = pd.DataFrame(rows)
+        results_df["Rank"] = results_df["Rank"].astype("Int64")
+        st.session_state["results_df"] = results_df
+
+
+# ---------------------------------------------------------------------------
+# Saved OML input (re-grade without re-uploading PDFs)
+# ---------------------------------------------------------------------------
+# A bridge_oml.csv from a previous session already reflects PDF parsing,
+# manual entries, and duplicate removal, so it holds everything grading
+# needs: name, cost, GO/NO GO status, notes, and source file. The OML
+# Position column is ignored; order is recomputed from cost.
+
+OML_REQUIRED_COLUMNS = ["Name", "Cost", "Structural Status"]
+
+
+def load_oml_csv(file_bytes: bytes):
+    """Read a saved OML CSV into records for grading.
+
+    Returns (records, problems):
+        records  -> list of dicts in the same shape extract_record() returns
+        problems -> list of strings describing rows that were skipped
+
+    Raises ValueError if the file is not a CSV with the required columns.
+    Costs edited in Excel (e.g. "$300,000.00") are accepted. Rows with a
+    missing or non-numeric cost, or a status other than GO / NO GO, are
+    skipped and reported rather than guessed.
+    """
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, keep_default_na=False)
+    except Exception as e:
+        raise ValueError(f"could not read the file as CSV ({type(e).__name__}: {e})")
+
+    missing = [c for c in OML_REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "missing required column(s): " + ", ".join(missing)
+            + ". Upload a bridge_oml.csv exported by this app."
+        )
+
+    records = []
+    problems = []
+    for i, row in df.iterrows():
+        line = i + 2  # CSV line number, counting the header as line 1
+        name = row["Name"].strip() or "Unknown"
+
+        cost_text = row["Cost"].strip().replace("$", "").replace(",", "")
+        try:
+            cost = float(cost_text)
+        except ValueError:
+            problems.append(f"line {line} ({name}): cost \"{row['Cost']}\" is not a number")
+            continue
+
+        status = " ".join(row["Structural Status"].split()).upper()
+        if status not in ("GO", "NO GO"):
+            problems.append(
+                f"line {line} ({name}): status \"{row['Structural Status']}\" is not GO or NO GO"
+            )
+            continue
+
+        records.append(
+            {
+                "file": row.get("Source File", "").strip() or "(not recorded)",
+                "name": name,
+                "cost": cost,
+                "status": status,
+                "note": row.get("Notes", "").strip(),
+            }
+        )
+
+    return records, problems
+
+
+# ---------------------------------------------------------------------------
 # Page setup
 # ---------------------------------------------------------------------------
 
@@ -330,6 +460,10 @@ submissions.
 
 5. Review and download the OML, which ranks every submission: GO
    submissions first by cost, then NO GO submissions by cost.
+
+6. To adjust the grading spread later, choose **Re-grade from a saved OML
+   CSV** and upload the bridge_oml.csv from step 5. Grades update as soon as
+   you change the grading sensitivity; no PDFs or manual entries needed.
 
 **Structural soundness check**
 Each plan sheet has a **"{STRUCTURAL_PASS_PHRASE}"**, **"{STRUCTURAL_FAIL_LOAD}"**,
@@ -381,256 +515,285 @@ st.divider()
 # Upload + processing
 # ---------------------------------------------------------------------------
 
-uploaded_files = st.file_uploader(
-    "Upload bridge plan PDFs, or a ZIP of PDFs",
-    type=["pdf", "zip"],
-    accept_multiple_files=True,
+MODE_PDF = "Grade from PDFs"
+MODE_OML = "Re-grade from a saved OML CSV"
+
+input_mode = st.radio(
+    "Input",
+    [MODE_PDF, MODE_OML],
+    horizontal=True,
+    help=(
+        "Use \"Re-grade from a saved OML CSV\" to load the bridge_oml.csv "
+        "from an earlier session and adjust the grading sensitivity without "
+        "re-uploading PDFs or re-entering manual rows."
+    ),
 )
 
-if uploaded_files:
-    # Expand ZIPs into individual PDF submissions. Every later step works on
-    # this list, so a PDF inside a ZIP is handled exactly like a plain upload.
-    submissions, skipped_in_zip, bad_zips = list_submissions(uploaded_files)
-    submission_names = [name for name, _, _ in submissions]
-
-    st.write(
-        f"{len(uploaded_files)} file(s) selected, containing "
-        f"{len(submissions)} PDF submission(s)."
-    )
-    if bad_zips:
-        st.error(
-            "The following ZIP file(s) could not be opened and are excluded:\n"
-            + "\n".join(f"- {name} ({reason})" for name, reason in bad_zips)
-        )
-    if skipped_in_zip:
-        st.info(
-            "The following non-PDF file(s) inside ZIP uploads were skipped:\n"
-            + "\n".join(f"- {name}" for name in skipped_in_zip)
-        )
-
-    # Identifies the current upload set. If files are added or removed, or the
-    # sensitivity setting changes, after grading, the stored results no longer
-    # match the inputs and are discarded so stale grades are never shown.
-    file_sig = tuple((f.name, f.size) for f in uploaded_files)
-    graded_with = st.session_state.get("graded_with")
-    if graded_with is not None and graded_with != {"sig": file_sig, "penalty": full_penalty_pct}:
-        for key in ("graded_with", "results_df", "oml_df"):
-            st.session_state.pop(key, None)
-        st.info(
-            "The uploaded files or the grading sensitivity changed. Click "
-            "**Check and grade submissions** again."
-        )
-
-    # -----------------------------------------------------------------------
-    # Manual entry + grade button
-    # -----------------------------------------------------------------------
-    # The manual entry table and the button are in one form, so editing the
-    # table does not rerun the app. Entries are applied only when the button
-    # is clicked. A manual row replaces everything the app would read from
-    # that file (the file is not parsed). Rows with no file selected or a
-    # blank cost are ignored. Status defaults to NO GO (the same safe default
-    # used for an unrecognized Status line), so set GO only after confirming
-    # "passes all tests" on the plan sheet.
-    with st.form("grading_form"):
-        st.markdown("**Manual entry (optional)**")
-        st.caption(
-            "Fill this in before clicking the button. Add a row for any file "
-            "the app cannot read: pick the file, then enter the designer's "
-            "name, cost, and structural status. A manual row replaces anything "
-            "the app reads from that file. Rows with a blank cost are ignored. "
-            "Manual rows are marked \"manually entered\" in the Notes column of "
-            "both CSVs."
-        )
-        manual_df = st.data_editor(
-            pd.DataFrame(
-                {
-                    "Source File": pd.Series(dtype="object"),
-                    "Name": pd.Series(dtype="object"),
-                    "Cost": pd.Series(dtype="float64"),
-                    "Structural Status": pd.Series(dtype="object"),
-                    "Notes": pd.Series(dtype="object"),
-                }
-            ),
-            key="manual_entry_editor",
-            hide_index=True,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Source File": st.column_config.SelectboxColumn(
-                    "Source File", options=submission_names
-                ),
-                "Name": st.column_config.TextColumn("Name"),
-                "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="$%.2f"),
-                "Structural Status": st.column_config.SelectboxColumn(
-                    "Structural Status", options=["GO", "NO GO"], default="NO GO"
-                ),
-                "Notes": st.column_config.TextColumn("Notes (optional)"),
-            },
-        )
-        submitted = st.form_submit_button("Check and grade submissions", type="primary")
-
-    if submitted:
-        # Convert valid manual rows to records, keyed by file. If the same
-        # file is entered twice, the later row wins.
-        uploaded_names = set(submission_names)
-        manual_by_file = {}
-        for _, row in manual_df.iterrows():
-            file_name = row["Source File"]
-            if pd.isna(file_name) or file_name not in uploaded_names or pd.isna(row["Cost"]):
-                continue
-            name = "" if pd.isna(row["Name"]) else str(row["Name"]).strip()
-            user_note = "" if pd.isna(row["Notes"]) else str(row["Notes"]).strip()
-            status = row["Structural Status"] if row["Structural Status"] in ("GO", "NO GO") else "NO GO"
-            manual_by_file[file_name] = {
-                "file": file_name,
-                "name": name or "Unknown",
-                "cost": float(row["Cost"]),
-                "status": status,
-                "note": "manually entered" + (f"; {user_note}" if user_note else ""),
-            }
-
-        go_records = []
-        no_go_records = []
-        unparsed = []
-        # Files pdfplumber cannot open at all (corrupt, empty, encrypted, or
-        # not actually a PDF). Kept separate from "unparsed" so the grader can
-        # tell a broken file apart from a valid PDF that lacks a cost line.
-        unreadable = []
-
-        parsed = []
-
-        for sub_name, f, zip_member in submissions:
-            # Files with a manual row are taken from the manual table only.
-            if sub_name in manual_by_file:
-                continue
-            # getvalue() returns the full contents regardless of the file's
-            # read position, so a previously read file never comes back empty.
-            # read_submission_bytes() uses it for plain PDFs and ZIP members.
-            try:
-                file_bytes = read_submission_bytes(f, zip_member)
-            except Exception as e:
-                unreadable.append((sub_name, f"{type(e).__name__}: {e}"))
-                continue
-            if not file_bytes:
-                unreadable.append((sub_name, "file is empty"))
-                continue
-            try:
-                rec = extract_record(sub_name, file_bytes)
-            except Exception as e:
-                # One bad file should not stop the whole batch.
-                unreadable.append((sub_name, f"{type(e).__name__}: {e}"))
-                continue
-            if rec is None:
-                unparsed.append(sub_name)
-            else:
-                parsed.append(rec)
-
-        parsed += list(manual_by_file.values())
-
-        # Keep one submission per designer name before splitting GO/NO GO,
-        # so duplicates never reach grading, the OML, or either CSV.
-        parsed, duplicates = dedupe_by_name(parsed)
-
-        for rec in parsed:
-            if rec["status"] == "GO":
-                go_records.append(rec)
-            else:
-                no_go_records.append(rec)
-
-        if unreadable:
-            st.error(
-                "The following file(s) could not be opened as PDFs and are "
-                "excluded. Re-upload a valid PDF, or add a row for each in "
-                "Manual entry above and click the button again:\n"
-                + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
-            )
-
-        if unparsed:
-            st.warning(
-                "Could not find a cost on the following file(s); they are "
-                "excluded unless you add a row for each in Manual entry above "
-                "and click the button again:\n"
-                + "\n".join(f"- {name}" for name in unparsed)
-            )
-
-        if duplicates:
-            # "\\$" escapes the dollar sign so Streamlit does not render the
-            # text between two dollar amounts as LaTeX math.
-            st.warning(
-                "Multiple submissions were found for the same name. Only the "
-                "cheapest GO submission per name is kept (or the cheapest NO GO "
-                "if none passed). The following were removed:\n"
-                + "\n".join(
-                    f"- {d['file']} ({d['name']}, \\${d['cost']:,.2f}, {d['status']}): "
-                    f"kept {k['file']} (\\${k['cost']:,.2f}, {k['status']})"
-                    for d, k in duplicates
-                )
-            )
-
-        if no_go_records:
-            st.error(
-                "The following submission(s) failed the structural soundness "
-                "check and are excluded from cost ranking:\n"
-                + "\n".join(f"- {r['name']} ({r['file']}): {r['note']}" for r in no_go_records)
-            )
-
-        # Record what these results were computed from, for the stale check.
-        st.session_state["graded_with"] = {"sig": file_sig, "penalty": full_penalty_pct}
-
-        # The OML covers every parsed submission and does not depend on
-        # grading, so it is built even when fewer than 3 are GO. It is
-        # built before grade() runs, from the same parsed records.
-        if go_records or no_go_records:
-            st.session_state["oml_df"] = pd.DataFrame(build_oml(go_records, no_go_records))
-        else:
-            st.session_state.pop("oml_df", None)
-
-        if len(go_records) < 3:
-            st.error(
-                f"Only {len(go_records)} qualifying submission(s) found. "
-                "At least 3 are required to grade (the top-3 tiers need 3 estimates)."
-            )
-            if go_records or no_go_records:
-                st.info("The order of merit list is still produced below.")
-            st.session_state.pop("results_df", None)
-        else:
-            graded = grade(go_records, full_penalty_pct=full_penalty_pct)
-
-            rows = []
-            for r in graded:
-                rows.append(
-                    {
-                        "Rank": r["rank"],
-                        "Name": r["name"],
-                        "Cost": r["cost"],
-                        "Recommended Grade": r["grade"],
-                        "Structural Status": "GO",
-                        # Empty for PDF-parsed GO submissions; "manually
-                        # entered" for rows from the manual entry table.
-                        "Notes": r["note"],
-                        "Source File": r["file"],
-                    }
-                )
-            for r in no_go_records:
-                rows.append(
-                    {
-                        "Rank": None,
-                        "Name": r["name"],
-                        "Cost": r["cost"],
-                        "Recommended Grade": None,
-                        "Structural Status": "NO GO",
-                        "Notes": r["note"],
-                        "Source File": r["file"],
-                    }
-                )
-
-            results_df = pd.DataFrame(rows)
-            results_df["Rank"] = results_df["Rank"].astype("Int64")
-            st.session_state["results_df"] = results_df
-else:
-    # Uploader cleared: drop results from the previous batch.
+# Switching modes discards the other mode's results so the tables below
+# always match the selected input.
+if st.session_state.get("input_mode") != input_mode:
     for key in ("graded_with", "results_df", "oml_df"):
         st.session_state.pop(key, None)
+    st.session_state["input_mode"] = input_mode
+
+if input_mode == MODE_PDF:
+    uploaded_files = st.file_uploader(
+        "Upload bridge plan PDFs, or a ZIP of PDFs",
+        type=["pdf", "zip"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded_files:
+        # Expand ZIPs into individual PDF submissions. Every later step works on
+        # this list, so a PDF inside a ZIP is handled exactly like a plain upload.
+        submissions, skipped_in_zip, bad_zips = list_submissions(uploaded_files)
+        submission_names = [name for name, _, _ in submissions]
+
+        st.write(
+            f"{len(uploaded_files)} file(s) selected, containing "
+            f"{len(submissions)} PDF submission(s)."
+        )
+        if bad_zips:
+            st.error(
+                "The following ZIP file(s) could not be opened and are excluded:\n"
+                + "\n".join(f"- {name} ({reason})" for name, reason in bad_zips)
+            )
+        if skipped_in_zip:
+            st.info(
+                "The following non-PDF file(s) inside ZIP uploads were skipped:\n"
+                + "\n".join(f"- {name}" for name in skipped_in_zip)
+            )
+
+        # Identifies the current upload set. If files are added or removed, or the
+        # sensitivity setting changes, after grading, the stored results no longer
+        # match the inputs and are discarded so stale grades are never shown.
+        file_sig = tuple((f.name, f.size) for f in uploaded_files)
+        graded_with = st.session_state.get("graded_with")
+        if graded_with is not None and graded_with != {"sig": file_sig, "penalty": full_penalty_pct}:
+            for key in ("graded_with", "results_df", "oml_df"):
+                st.session_state.pop(key, None)
+            st.info(
+                "The uploaded files or the grading sensitivity changed. Click "
+                "**Check and grade submissions** again."
+            )
+
+        # -----------------------------------------------------------------------
+        # Manual entry + grade button
+        # -----------------------------------------------------------------------
+        # The manual entry table and the button are in one form, so editing the
+        # table does not rerun the app. Entries are applied only when the button
+        # is clicked. A manual row replaces everything the app would read from
+        # that file (the file is not parsed). Rows with no file selected or a
+        # blank cost are ignored. Status defaults to NO GO (the same safe default
+        # used for an unrecognized Status line), so set GO only after confirming
+        # "passes all tests" on the plan sheet.
+        with st.form("grading_form"):
+            st.markdown("**Manual entry (optional)**")
+            st.caption(
+                "Fill this in before clicking the button. Add a row for any file "
+                "the app cannot read: pick the file, then enter the designer's "
+                "name, cost, and structural status. A manual row replaces anything "
+                "the app reads from that file. Rows with a blank cost are ignored. "
+                "Manual rows are marked \"manually entered\" in the Notes column of "
+                "both CSVs."
+            )
+            manual_df = st.data_editor(
+                pd.DataFrame(
+                    {
+                        "Source File": pd.Series(dtype="object"),
+                        "Name": pd.Series(dtype="object"),
+                        "Cost": pd.Series(dtype="float64"),
+                        "Structural Status": pd.Series(dtype="object"),
+                        "Notes": pd.Series(dtype="object"),
+                    }
+                ),
+                key="manual_entry_editor",
+                hide_index=True,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Source File": st.column_config.SelectboxColumn(
+                        "Source File", options=submission_names
+                    ),
+                    "Name": st.column_config.TextColumn("Name"),
+                    "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="$%.2f"),
+                    "Structural Status": st.column_config.SelectboxColumn(
+                        "Structural Status", options=["GO", "NO GO"], default="NO GO"
+                    ),
+                    "Notes": st.column_config.TextColumn("Notes (optional)"),
+                },
+            )
+            submitted = st.form_submit_button("Check and grade submissions", type="primary")
+
+        if submitted:
+            # Convert valid manual rows to records, keyed by file. If the same
+            # file is entered twice, the later row wins.
+            uploaded_names = set(submission_names)
+            manual_by_file = {}
+            for _, row in manual_df.iterrows():
+                file_name = row["Source File"]
+                if pd.isna(file_name) or file_name not in uploaded_names or pd.isna(row["Cost"]):
+                    continue
+                name = "" if pd.isna(row["Name"]) else str(row["Name"]).strip()
+                user_note = "" if pd.isna(row["Notes"]) else str(row["Notes"]).strip()
+                status = row["Structural Status"] if row["Structural Status"] in ("GO", "NO GO") else "NO GO"
+                manual_by_file[file_name] = {
+                    "file": file_name,
+                    "name": name or "Unknown",
+                    "cost": float(row["Cost"]),
+                    "status": status,
+                    "note": "manually entered" + (f"; {user_note}" if user_note else ""),
+                }
+
+            go_records = []
+            no_go_records = []
+            unparsed = []
+            # Files pdfplumber cannot open at all (corrupt, empty, encrypted, or
+            # not actually a PDF). Kept separate from "unparsed" so the grader can
+            # tell a broken file apart from a valid PDF that lacks a cost line.
+            unreadable = []
+
+            parsed = []
+
+            for sub_name, f, zip_member in submissions:
+                # Files with a manual row are taken from the manual table only.
+                if sub_name in manual_by_file:
+                    continue
+                # getvalue() returns the full contents regardless of the file's
+                # read position, so a previously read file never comes back empty.
+                # read_submission_bytes() uses it for plain PDFs and ZIP members.
+                try:
+                    file_bytes = read_submission_bytes(f, zip_member)
+                except Exception as e:
+                    unreadable.append((sub_name, f"{type(e).__name__}: {e}"))
+                    continue
+                if not file_bytes:
+                    unreadable.append((sub_name, "file is empty"))
+                    continue
+                try:
+                    rec = extract_record(sub_name, file_bytes)
+                except Exception as e:
+                    # One bad file should not stop the whole batch.
+                    unreadable.append((sub_name, f"{type(e).__name__}: {e}"))
+                    continue
+                if rec is None:
+                    unparsed.append(sub_name)
+                else:
+                    parsed.append(rec)
+
+            parsed += list(manual_by_file.values())
+
+            # Keep one submission per designer name before splitting GO/NO GO,
+            # so duplicates never reach grading, the OML, or either CSV.
+            parsed, duplicates = dedupe_by_name(parsed)
+
+            for rec in parsed:
+                if rec["status"] == "GO":
+                    go_records.append(rec)
+                else:
+                    no_go_records.append(rec)
+
+            if unreadable:
+                st.error(
+                    "The following file(s) could not be opened as PDFs and are "
+                    "excluded. Re-upload a valid PDF, or add a row for each in "
+                    "Manual entry above and click the button again:\n"
+                    + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
+                )
+
+            if unparsed:
+                st.warning(
+                    "Could not find a cost on the following file(s); they are "
+                    "excluded unless you add a row for each in Manual entry above "
+                    "and click the button again:\n"
+                    + "\n".join(f"- {name}" for name in unparsed)
+                )
+
+            if duplicates:
+                # "\\$" escapes the dollar sign so Streamlit does not render the
+                # text between two dollar amounts as LaTeX math.
+                st.warning(
+                    "Multiple submissions were found for the same name. Only the "
+                    "cheapest GO submission per name is kept (or the cheapest NO GO "
+                    "if none passed). The following were removed:\n"
+                    + "\n".join(
+                        f"- {d['file']} ({d['name']}, \\${d['cost']:,.2f}, {d['status']}): "
+                        f"kept {k['file']} (\\${k['cost']:,.2f}, {k['status']})"
+                        for d, k in duplicates
+                    )
+                )
+
+            if no_go_records:
+                st.error(
+                    "The following submission(s) failed the structural soundness "
+                    "check and are excluded from cost ranking:\n"
+                    + "\n".join(f"- {r['name']} ({r['file']}): {r['note']}" for r in no_go_records)
+                )
+
+            # Record what these results were computed from, for the stale check.
+            st.session_state["graded_with"] = {"sig": file_sig, "penalty": full_penalty_pct}
+
+            build_oml_and_results(go_records, no_go_records, full_penalty_pct)
+    else:
+        # Uploader cleared: drop results from the previous batch.
+        for key in ("graded_with", "results_df", "oml_df"):
+            st.session_state.pop(key, None)
+
+else:
+    # -----------------------------------------------------------------------
+    # Saved OML mode
+    # -----------------------------------------------------------------------
+    # No PDF parsing or button: grading is cheap, so it reruns on every
+    # change, and editing the sensitivity setting above updates the grades
+    # immediately.
+    oml_file = st.file_uploader("Upload a saved bridge_oml.csv", type="csv")
+
+    if oml_file is None:
+        for key in ("graded_with", "results_df", "oml_df"):
+            st.session_state.pop(key, None)
+    else:
+        try:
+            oml_records, oml_problems = load_oml_csv(oml_file.getvalue())
+        except ValueError as e:
+            oml_records, oml_problems = None, []
+            st.error(f"{oml_file.name}: {e}")
+            for key in ("graded_with", "results_df", "oml_df"):
+                st.session_state.pop(key, None)
+
+        if oml_records is not None:
+            if oml_problems:
+                st.warning(
+                    "The following row(s) were skipped. Fix them in the CSV "
+                    "and upload it again:\n"
+                    + "\n".join(f"- {p}" for p in oml_problems)
+                )
+
+            # A saved OML is already one row per designer. Deduplicating
+            # again is a safeguard in case rows were added by hand.
+            oml_records, oml_duplicates = dedupe_by_name(oml_records)
+            if oml_duplicates:
+                # "\\$" escapes the dollar sign so Streamlit does not render
+                # the text between two dollar amounts as LaTeX math.
+                st.warning(
+                    "The CSV has more than one row for the same name. Only the "
+                    "cheapest GO row per name is kept (or the cheapest NO GO if "
+                    "none passed). Removed:\n"
+                    + "\n".join(
+                        f"- {d['name']} (\\${d['cost']:,.2f}, {d['status']}): "
+                        f"kept \\${k['cost']:,.2f}, {k['status']}"
+                        for d, k in oml_duplicates
+                    )
+                )
+
+            go_records = [r for r in oml_records if r["status"] == "GO"]
+            no_go_records = [r for r in oml_records if r["status"] != "GO"]
+            st.write(
+                f"Loaded {len(oml_records)} submission(s) from {oml_file.name}: "
+                f"{len(go_records)} GO, {len(no_go_records)} NO GO. "
+                f"Grading with a {full_penalty_pct:g}% sensitivity."
+            )
+
+            build_oml_and_results(go_records, no_go_records, full_penalty_pct)
 
 # ---------------------------------------------------------------------------
 # Results
