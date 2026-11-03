@@ -328,31 +328,38 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.write(f"{len(uploaded_files)} file(s) selected.")
 
-    # Identifies the current upload set. If files are added or removed after
-    # extraction, the stored extraction no longer matches and is discarded so
-    # stale results are never shown for a different batch.
+    # Identifies the current upload set. If files are added or removed, or the
+    # sensitivity setting changes, after grading, the stored results no longer
+    # match the inputs and are discarded so stale grades are never shown.
     file_sig = tuple((f.name, f.size) for f in uploaded_files)
-    if st.session_state.get("extraction", {}).get("sig") not in (None, file_sig):
-        for key in ("extraction", "results_df", "oml_df"):
+    graded_with = st.session_state.get("graded_with")
+    if graded_with is not None and graded_with != {"sig": file_sig, "penalty": full_penalty_pct}:
+        for key in ("graded_with", "results_df", "oml_df"):
             st.session_state.pop(key, None)
-        st.info("The uploaded files changed. Click **Check and grade submissions** again.")
+        st.info(
+            "The uploaded files or the grading sensitivity changed. Click "
+            "**Check and grade submissions** again."
+        )
 
     # -----------------------------------------------------------------------
-    # Manual entry (optional; can be filled in before or after grading)
+    # Manual entry + grade button
     # -----------------------------------------------------------------------
-    # For files the app cannot read a cost from, or any file whose extracted
-    # values should be replaced. A manual row replaces everything the app
-    # reads from that file. Rows with no file selected or a blank cost are
-    # ignored. Status defaults to NO GO (the same safe default used for an
-    # unrecognized Status line), so set GO only after confirming "passes all
-    # tests" on the plan sheet. Entries are kept across reruns.
-    with st.expander("Manual entry (optional)", expanded=True):
+    # The manual entry table and the button are in one form, so editing the
+    # table does not rerun the app. Entries are applied only when the button
+    # is clicked. A manual row replaces everything the app would read from
+    # that file (the file is not parsed). Rows with no file selected or a
+    # blank cost are ignored. Status defaults to NO GO (the same safe default
+    # used for an unrecognized Status line), so set GO only after confirming
+    # "passes all tests" on the plan sheet.
+    with st.form("grading_form"):
+        st.markdown("**Manual entry (optional)**")
         st.caption(
-            "Add a row for any file the app cannot read. Pick the file, then "
-            "enter the designer's name, cost, and structural status. A manual "
-            "row replaces anything the app reads from that file. Rows with a "
-            "blank cost are ignored. Manual rows are marked \"manually "
-            "entered\" in the Notes column of both CSVs."
+            "Fill this in before clicking the button. Add a row for any file "
+            "the app cannot read: pick the file, then enter the designer's "
+            "name, cost, and structural status. A manual row replaces anything "
+            "the app reads from that file. Rows with a blank cost are ignored. "
+            "Manual rows are marked \"manually entered\" in the Notes column of "
+            "both CSVs."
         )
         manual_df = st.data_editor(
             pd.DataFrame(
@@ -380,27 +387,30 @@ if uploaded_files:
                 "Notes": st.column_config.TextColumn("Notes (optional)"),
             },
         )
+        submitted = st.form_submit_button("Check and grade submissions", type="primary")
 
-    # Convert valid manual rows to records, keyed by file. If the same file
-    # is entered twice, the later row wins.
-    uploaded_names = {f.name for f in uploaded_files}
-    manual_by_file = {}
-    for _, row in manual_df.iterrows():
-        file_name = row["Source File"]
-        if pd.isna(file_name) or file_name not in uploaded_names or pd.isna(row["Cost"]):
-            continue
-        name = "" if pd.isna(row["Name"]) else str(row["Name"]).strip()
-        user_note = "" if pd.isna(row["Notes"]) else str(row["Notes"]).strip()
-        status = row["Structural Status"] if row["Structural Status"] in ("GO", "NO GO") else "NO GO"
-        manual_by_file[file_name] = {
-            "file": file_name,
-            "name": name or "Unknown",
-            "cost": float(row["Cost"]),
-            "status": status,
-            "note": "manually entered" + (f"; {user_note}" if user_note else ""),
-        }
+    if submitted:
+        # Convert valid manual rows to records, keyed by file. If the same
+        # file is entered twice, the later row wins.
+        uploaded_names = {f.name for f in uploaded_files}
+        manual_by_file = {}
+        for _, row in manual_df.iterrows():
+            file_name = row["Source File"]
+            if pd.isna(file_name) or file_name not in uploaded_names or pd.isna(row["Cost"]):
+                continue
+            name = "" if pd.isna(row["Name"]) else str(row["Name"]).strip()
+            user_note = "" if pd.isna(row["Notes"]) else str(row["Notes"]).strip()
+            status = row["Structural Status"] if row["Structural Status"] in ("GO", "NO GO") else "NO GO"
+            manual_by_file[file_name] = {
+                "file": file_name,
+                "name": name or "Unknown",
+                "cost": float(row["Cost"]),
+                "status": status,
+                "note": "manually entered" + (f"; {user_note}" if user_note else ""),
+            }
 
-    if st.button("Check and grade submissions", type="primary"):
+        go_records = []
+        no_go_records = []
         unparsed = []
         # Files pdfplumber cannot open at all (corrupt, empty, encrypted, or
         # not actually a PDF). Kept separate from "unparsed" so the grader can
@@ -410,6 +420,9 @@ if uploaded_files:
         parsed = []
 
         for f in uploaded_files:
+            # Files with a manual row are taken from the manual table only.
+            if f.name in manual_by_file:
+                continue
             # getvalue() returns the full contents regardless of the file's
             # read position, so a previously read file never comes back empty.
             file_bytes = f.getvalue()
@@ -427,50 +440,7 @@ if uploaded_files:
             else:
                 parsed.append(rec)
 
-        # Store extraction results so they survive reruns. Everything below
-        # is recomputed from these on every rerun, so manual entries and the
-        # sensitivity setting take effect without re-reading the PDFs.
-        st.session_state["extraction"] = {
-            "sig": file_sig,
-            "parsed": parsed,
-            "unparsed": unparsed,
-            "unreadable": unreadable,
-        }
-
-    # -----------------------------------------------------------------------
-    # Merge manual entries, deduplicate, build OML, grade
-    # -----------------------------------------------------------------------
-
-    if "extraction" in st.session_state:
-        extraction = st.session_state["extraction"]
-
-        # Files with a manual row are taken from the manual table only, so
-        # they drop out of the extracted lists and the warnings below.
-        unparsed = [n for n in extraction["unparsed"] if n not in manual_by_file]
-        unreadable = [(n, why) for n, why in extraction["unreadable"] if n not in manual_by_file]
-
-        # Copies, so grade() adding rank/grade keys never alters the stored
-        # extraction between reruns.
-        parsed = [dict(r) for r in extraction["parsed"] if r["file"] not in manual_by_file]
-        parsed += [dict(r) for r in manual_by_file.values()]
-
-        go_records = []
-        no_go_records = []
-
-        if unreadable:
-            st.error(
-                "The following file(s) could not be opened as PDFs and are "
-                "excluded. Re-upload a valid PDF, or add a row for each in "
-                "Manual entry above:\n"
-                + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
-            )
-
-        if unparsed:
-            st.warning(
-                "Could not find a cost on the following file(s); they are "
-                "excluded unless you add a row for each in Manual entry above:\n"
-                + "\n".join(f"- {name}" for name in unparsed)
-            )
+        parsed += list(manual_by_file.values())
 
         # Keep one submission per designer name before splitting GO/NO GO,
         # so duplicates never reach grading, the OML, or either CSV.
@@ -481,6 +451,22 @@ if uploaded_files:
                 go_records.append(rec)
             else:
                 no_go_records.append(rec)
+
+        if unreadable:
+            st.error(
+                "The following file(s) could not be opened as PDFs and are "
+                "excluded. Re-upload a valid PDF, or add a row for each in "
+                "Manual entry above and click the button again:\n"
+                + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
+            )
+
+        if unparsed:
+            st.warning(
+                "Could not find a cost on the following file(s); they are "
+                "excluded unless you add a row for each in Manual entry above "
+                "and click the button again:\n"
+                + "\n".join(f"- {name}" for name in unparsed)
+            )
 
         if duplicates:
             # "\\$" escapes the dollar sign so Streamlit does not render the
@@ -502,6 +488,9 @@ if uploaded_files:
                 "check and are excluded from cost ranking:\n"
                 + "\n".join(f"- {r['name']} ({r['file']}): {r['note']}" for r in no_go_records)
             )
+
+        # Record what these results were computed from, for the stale check.
+        st.session_state["graded_with"] = {"sig": file_sig, "penalty": full_penalty_pct}
 
         # The OML covers every parsed submission and does not depend on
         # grading, so it is built even when fewer than 3 are GO. It is
@@ -555,7 +544,7 @@ if uploaded_files:
             st.session_state["results_df"] = results_df
 else:
     # Uploader cleared: drop results from the previous batch.
-    for key in ("extraction", "results_df", "oml_df"):
+    for key in ("graded_with", "results_df", "oml_df"):
         st.session_state.pop(key, None)
 
 # ---------------------------------------------------------------------------
