@@ -14,6 +14,7 @@ Run locally with:
 """
 
 import io
+import zipfile
 
 import altair as alt
 import pandas as pd
@@ -100,6 +101,67 @@ def extract_record(file_name: str, file_bytes: bytes):
     status, note = classify_structural_status(text)
 
     return {"file": file_name, "name": name, "cost": cost, "status": status, "note": note}
+
+
+# ---------------------------------------------------------------------------
+# Uploads: individual PDFs and/or ZIP files of PDFs
+# ---------------------------------------------------------------------------
+# A ZIP (e.g. Canvas "Download Submissions") uploads as one request instead of
+# one request per PDF, which avoids server errors on large batches. Each PDF
+# inside a ZIP is treated exactly like an individually uploaded PDF.
+
+def list_submissions(uploaded_files):
+    """Expand uploads into individual PDF submissions without reading PDF bytes.
+
+    Returns (submissions, skipped, bad_zips):
+        submissions -> list of (display_name, uploaded_file, zip_member or None)
+        skipped     -> non-PDF entries found inside ZIPs (listed, not graded)
+        bad_zips    -> list of (zip_name, reason) for ZIPs that cannot be opened
+
+    Display names are made unique (" (2)", " (3)", ...) so manual entries and
+    results always point to exactly one file.
+    """
+    submissions = []
+    skipped = []
+    bad_zips = []
+    seen = {}
+
+    def unique(name):
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        return name if count == 1 else f"{name} ({count})"
+
+    for f in uploaded_files:
+        if f.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(f.getvalue())) as zf:
+                    members = zf.namelist()
+            except Exception as e:
+                bad_zips.append((f.name, f"{type(e).__name__}: {e}"))
+                continue
+            for member in members:
+                base = member.rsplit("/", 1)[-1]
+                # Skip folders and macOS metadata entries.
+                if not base or member.startswith("__MACOSX/") or base.startswith("._"):
+                    continue
+                if base.lower().endswith(".pdf"):
+                    submissions.append((unique(base), f, member))
+                else:
+                    skipped.append(f"{f.name}: {member}")
+        else:
+            submissions.append((unique(f.name), f, None))
+
+    return submissions, skipped, bad_zips
+
+
+def read_submission_bytes(uploaded_file, zip_member):
+    """Return the PDF bytes for one submission (a plain upload or a ZIP member)."""
+    # getvalue() returns the full contents regardless of the file's read
+    # position, so a previously read file never comes back empty.
+    if zip_member is None:
+        return uploaded_file.getvalue()
+    with zipfile.ZipFile(io.BytesIO(uploaded_file.getvalue())) as zf:
+        return zf.read(zip_member)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +319,7 @@ submissions.
 
 1b. Have them submit those files to you via the most accessible medium. I prefer creating an assignment in Canvas that they submit to because it allows a mass download of all submissions.
 
-1c. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB**(one PDF per submission; a submission may be more than one page). 
+1c. Upload all PDF plan sheets for this round **in one bulk upload, all files < 200 MB** (one PDF per submission; a submission may be more than one page). For large batches, upload the **ZIP file** from Canvas "Download Submissions" instead of the individual PDFs; it uploads as one file and avoids upload errors. Non-PDF files inside a ZIP are skipped and listed.
 
 2. Click **Check and grade submissions**.
 
@@ -320,13 +382,31 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 uploaded_files = st.file_uploader(
-    "Upload bridge plan PDFs",
-    type="pdf",
+    "Upload bridge plan PDFs, or a ZIP of PDFs",
+    type=["pdf", "zip"],
     accept_multiple_files=True,
 )
 
 if uploaded_files:
-    st.write(f"{len(uploaded_files)} file(s) selected.")
+    # Expand ZIPs into individual PDF submissions. Every later step works on
+    # this list, so a PDF inside a ZIP is handled exactly like a plain upload.
+    submissions, skipped_in_zip, bad_zips = list_submissions(uploaded_files)
+    submission_names = [name for name, _, _ in submissions]
+
+    st.write(
+        f"{len(uploaded_files)} file(s) selected, containing "
+        f"{len(submissions)} PDF submission(s)."
+    )
+    if bad_zips:
+        st.error(
+            "The following ZIP file(s) could not be opened and are excluded:\n"
+            + "\n".join(f"- {name} ({reason})" for name, reason in bad_zips)
+        )
+    if skipped_in_zip:
+        st.info(
+            "The following non-PDF file(s) inside ZIP uploads were skipped:\n"
+            + "\n".join(f"- {name}" for name in skipped_in_zip)
+        )
 
     # Identifies the current upload set. If files are added or removed, or the
     # sensitivity setting changes, after grading, the stored results no longer
@@ -377,7 +457,7 @@ if uploaded_files:
             use_container_width=True,
             column_config={
                 "Source File": st.column_config.SelectboxColumn(
-                    "Source File", options=[f.name for f in uploaded_files]
+                    "Source File", options=submission_names
                 ),
                 "Name": st.column_config.TextColumn("Name"),
                 "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="$%.2f"),
@@ -392,7 +472,7 @@ if uploaded_files:
     if submitted:
         # Convert valid manual rows to records, keyed by file. If the same
         # file is entered twice, the later row wins.
-        uploaded_names = {f.name for f in uploaded_files}
+        uploaded_names = set(submission_names)
         manual_by_file = {}
         for _, row in manual_df.iterrows():
             file_name = row["Source File"]
@@ -419,24 +499,29 @@ if uploaded_files:
 
         parsed = []
 
-        for f in uploaded_files:
+        for sub_name, f, zip_member in submissions:
             # Files with a manual row are taken from the manual table only.
-            if f.name in manual_by_file:
+            if sub_name in manual_by_file:
                 continue
             # getvalue() returns the full contents regardless of the file's
             # read position, so a previously read file never comes back empty.
-            file_bytes = f.getvalue()
+            # read_submission_bytes() uses it for plain PDFs and ZIP members.
+            try:
+                file_bytes = read_submission_bytes(f, zip_member)
+            except Exception as e:
+                unreadable.append((sub_name, f"{type(e).__name__}: {e}"))
+                continue
             if not file_bytes:
-                unreadable.append((f.name, "file is empty"))
+                unreadable.append((sub_name, "file is empty"))
                 continue
             try:
-                rec = extract_record(f.name, file_bytes)
+                rec = extract_record(sub_name, file_bytes)
             except Exception as e:
                 # One bad file should not stop the whole batch.
-                unreadable.append((f.name, f"{type(e).__name__}: {e}"))
+                unreadable.append((sub_name, f"{type(e).__name__}: {e}"))
                 continue
             if rec is None:
-                unparsed.append(f.name)
+                unparsed.append(sub_name)
             else:
                 parsed.append(rec)
 
