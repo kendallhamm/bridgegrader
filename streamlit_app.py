@@ -332,11 +332,26 @@ if uploaded_files:
         go_records = []
         no_go_records = []
         unparsed = []
+        # Files pdfplumber cannot open at all (corrupt, empty, encrypted, or
+        # not actually a PDF). Kept separate from "unparsed" so the grader can
+        # tell a broken file apart from a valid PDF that lacks a cost line.
+        unreadable = []
 
         parsed = []
 
         for f in uploaded_files:
-            rec = extract_record(f.name, f.read())
+            # getvalue() returns the full contents regardless of the file's
+            # read position, so a previously read file never comes back empty.
+            file_bytes = f.getvalue()
+            if not file_bytes:
+                unreadable.append((f.name, "file is empty"))
+                continue
+            try:
+                rec = extract_record(f.name, file_bytes)
+            except Exception as e:
+                # One bad file should not stop the whole batch.
+                unreadable.append((f.name, f"{type(e).__name__}: {e}"))
+                continue
             if rec is None:
                 unparsed.append(f.name)
             else:
@@ -351,6 +366,14 @@ if uploaded_files:
                 go_records.append(rec)
             else:
                 no_go_records.append(rec)
+
+        if unreadable:
+            st.error(
+                "The following file(s) could not be opened as PDFs and are "
+                "excluded entirely. Check that each is a valid, unencrypted PDF "
+                "and re-upload it:\n"
+                + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
+            )
 
         if unparsed:
             st.warning(
