@@ -852,7 +852,12 @@ if "results_df" in st.session_state:
         st.altair_chart(chart, use_container_width=True)
 
         try:
-            grade_chart_png = chart.to_image(format="png", scale=2)
+            # Chart.save() renders the PNG with vl-convert. A file-like
+            # target requires an explicit format; scale_factor=2 doubles
+            # the pixel size for a sharper image.
+            png_buf = io.BytesIO()
+            chart.save(png_buf, format="png", scale_factor=2)
+            grade_chart_png = png_buf.getvalue()
             st.download_button(
                 "Download this chart as PNG",
                 data=grade_chart_png,
@@ -897,7 +902,9 @@ if "results_df" in st.session_state:
         st.altair_chart(rank_chart, use_container_width=True)
 
         try:
-            rank_chart_png = rank_chart.to_image(format="png", scale=2)
+            png_buf = io.BytesIO()
+            rank_chart.save(png_buf, format="png", scale_factor=2)
+            rank_chart_png = png_buf.getvalue()
             st.download_button(
                 "Download this chart as PNG",
                 data=rank_chart_png,
