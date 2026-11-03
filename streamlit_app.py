@@ -70,14 +70,16 @@ def classify_structural_status(text: str):
 
 
 def extract_record(file_name: str, file_bytes: bytes):
-    """Read every page of a PDF and pull the designer name, cost, and
-    structural soundness status.
+    """Read every page of a PDF and pull the designer name, cost, iteration
+    count, and structural soundness status.
 
     All pages are joined in order, so a single submission that spans two
     or more pages is read as one plan sheet.
 
     Returns a dict, or None if no cost could be found (file is reported to
-    the user as unparsed rather than silently skipped).
+    the user as unparsed rather than silently skipped). A missing or
+    unreadable iteration count does not reject the file; "iterations" is
+    None in that case.
     """
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         # Join all pages so fields or the Status line on page 2+ are found.
@@ -96,11 +98,45 @@ def extract_record(file_name: str, file_bytes: bytes):
     except ValueError:
         return None
 
+    # The iteration count is the last field on the cost line:
+    #   "Cost: $213,904.11 Date: 3 Nov 2026 Iteration: 73"
+    iterations = parse_iterations(cost_line.split("Iteration:", 1)[1]) if "Iteration:" in cost_line else None
+
     name = get_line_value(text, "Designed by") or "Unknown"
 
     status, note = classify_structural_status(text)
 
-    return {"file": file_name, "name": name, "cost": cost, "status": status, "note": note}
+    return {
+        "file": file_name,
+        "name": name,
+        "cost": cost,
+        "iterations": iterations,
+        "status": status,
+        "note": note,
+    }
+
+
+def parse_iterations(value):
+    """Return a whole-number iteration count from text or a number, or None.
+
+    Accepts "73", " 73 ", 73, and 73.0 (pandas and Excel often turn whole
+    numbers into floats). Anything blank, negative, fractional, or
+    non-numeric returns None rather than a guessed value.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        number = float(text)
+        # int() rejects "nan" and "inf" text with ValueError/OverflowError.
+        whole = int(number)
+    except (ValueError, OverflowError):
+        return None
+    if number < 0 or number != whole:
+        return None
+    return whole
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +311,9 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
     upload order (Python's sort is stable). No grades are assigned here;
     grading is handled separately by grade() and needs at least 3 GO
     submissions, while the OML does not. The Notes column carries the
-    NO GO reason from classify_structural_status().
+    NO GO reason from classify_structural_status(). The Iterations column
+    is informational only and does not affect order or grades; it is blank
+    when the count was not found.
     """
     go_sorted = sorted(go_records, key=lambda r: r["cost"])
     no_go_sorted = sorted(no_go_records, key=lambda r: r["cost"])
@@ -287,6 +325,9 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
                 "OML Position": pos,
                 "Name": r["name"],
                 "Cost": r["cost"],
+                # .get() so records from older code paths without the key
+                # still work; missing counts show as blank.
+                "Iterations": r.get("iterations"),
                 "Structural Status": r["status"],
                 "Notes": r["note"],
                 "Source File": r["file"],
@@ -309,7 +350,11 @@ def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], ful
     # grading, so it is built even when fewer than 3 are GO. It is
     # built before grade() runs, from the same parsed records.
     if go_records or no_go_records:
-        st.session_state["oml_df"] = pd.DataFrame(build_oml(go_records, no_go_records))
+        oml_df = pd.DataFrame(build_oml(go_records, no_go_records))
+        # Nullable integer type: whole numbers display without ".0", and
+        # missing counts stay blank in the table and the CSV.
+        oml_df["Iterations"] = oml_df["Iterations"].astype("Int64")
+        st.session_state["oml_df"] = oml_df
     else:
         st.session_state.pop("oml_df", None)
 
@@ -373,12 +418,15 @@ def load_oml_csv(file_bytes: bytes):
 
     Returns (records, problems):
         records  -> list of dicts in the same shape extract_record() returns
-        problems -> list of strings describing rows that were skipped
+        problems -> list of strings describing rows that were skipped or
+                    loaded with a blank iteration count
 
     Raises ValueError if the file is not a CSV with the required columns.
     Costs edited in Excel (e.g. "$300,000.00") are accepted. Rows with a
     missing or non-numeric cost, or a status other than GO / NO GO, are
-    skipped and reported rather than guessed.
+    skipped and reported rather than guessed. The Iterations column is
+    optional (OML files saved before it existed still load); a value that
+    is not a whole number is reported and left blank, and the row is kept.
     """
     try:
         df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, keep_default_na=False)
@@ -402,21 +450,30 @@ def load_oml_csv(file_bytes: bytes):
         try:
             cost = float(cost_text)
         except ValueError:
-            problems.append(f"line {line} ({name}): cost \"{row['Cost']}\" is not a number")
+            problems.append(f"line {line} ({name}): cost \"{row['Cost']}\" is not a number; row skipped")
             continue
 
         status = " ".join(row["Structural Status"].split()).upper()
         if status not in ("GO", "NO GO"):
             problems.append(
-                f"line {line} ({name}): status \"{row['Structural Status']}\" is not GO or NO GO"
+                f"line {line} ({name}): status \"{row['Structural Status']}\" is not GO or NO GO; row skipped"
             )
             continue
+
+        iterations_text = row.get("Iterations", "").strip()
+        iterations = parse_iterations(iterations_text)
+        if iterations_text and iterations is None:
+            problems.append(
+                f"line {line} ({name}): iterations \"{iterations_text}\" is not a whole "
+                "number; row kept with iterations left blank"
+            )
 
         records.append(
             {
                 "file": row.get("Source File", "").strip() or "(not recorded)",
                 "name": name,
                 "cost": cost,
+                "iterations": iterations,
                 "status": status,
                 "note": row.get("Notes", "").strip(),
             }
@@ -592,8 +649,9 @@ if input_mode == MODE_PDF:
             st.caption(
                 "Fill this in before clicking the button. Add a row for any file "
                 "the app cannot read: pick the file, then enter the designer's "
-                "name, cost, and structural status. A manual row replaces anything "
-                "the app reads from that file. Rows with a blank cost are ignored. "
+                "name, cost, and structural status (iterations is optional). A "
+                "manual row replaces anything the app reads from that file. Rows "
+                "with a blank cost are ignored. "
                 "Manual rows are marked \"manually entered\" in the Notes column of "
                 "both CSVs."
             )
@@ -603,6 +661,7 @@ if input_mode == MODE_PDF:
                         "Source File": pd.Series(dtype="object"),
                         "Name": pd.Series(dtype="object"),
                         "Cost": pd.Series(dtype="float64"),
+                        "Iterations": pd.Series(dtype="float64"),
                         "Structural Status": pd.Series(dtype="object"),
                         "Notes": pd.Series(dtype="object"),
                     }
@@ -617,6 +676,9 @@ if input_mode == MODE_PDF:
                     ),
                     "Name": st.column_config.TextColumn("Name"),
                     "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="$%.2f"),
+                    "Iterations": st.column_config.NumberColumn(
+                        "Iterations (optional)", min_value=0, step=1, format="%d"
+                    ),
                     "Structural Status": st.column_config.SelectboxColumn(
                         "Structural Status", options=["GO", "NO GO"], default="NO GO"
                     ),
@@ -641,6 +703,7 @@ if input_mode == MODE_PDF:
                     "file": file_name,
                     "name": name or "Unknown",
                     "cost": float(row["Cost"]),
+                    "iterations": parse_iterations(row["Iterations"]),
                     "status": status,
                     "note": "manually entered" + (f"; {user_note}" if user_note else ""),
                 }
@@ -763,7 +826,7 @@ else:
         if oml_records is not None:
             if oml_problems:
                 st.warning(
-                    "The following row(s) were skipped. Fix them in the CSV "
+                    "The following issue(s) were found in the CSV. Fix them "
                     "and upload it again:\n"
                     + "\n".join(f"- {p}" for p in oml_problems)
                 )
@@ -932,7 +995,7 @@ if "oml_df" in st.session_state:
         "continuous across both groups. Unparsed files are not included."
     )
     st.dataframe(
-        oml_df.style.format({"Cost": "${:,.2f}"}),
+        oml_df.style.format({"Cost": "${:,.2f}"}, na_rep="-"),
         use_container_width=True,
         hide_index=True,
     )
