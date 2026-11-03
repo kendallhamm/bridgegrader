@@ -328,9 +328,79 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.write(f"{len(uploaded_files)} file(s) selected.")
 
+    # Identifies the current upload set. If files are added or removed after
+    # extraction, the stored extraction no longer matches and is discarded so
+    # stale results are never shown for a different batch.
+    file_sig = tuple((f.name, f.size) for f in uploaded_files)
+    if st.session_state.get("extraction", {}).get("sig") not in (None, file_sig):
+        for key in ("extraction", "results_df", "oml_df"):
+            st.session_state.pop(key, None)
+        st.info("The uploaded files changed. Click **Check and grade submissions** again.")
+
+    # -----------------------------------------------------------------------
+    # Manual entry (optional; can be filled in before or after grading)
+    # -----------------------------------------------------------------------
+    # For files the app cannot read a cost from, or any file whose extracted
+    # values should be replaced. A manual row replaces everything the app
+    # reads from that file. Rows with no file selected or a blank cost are
+    # ignored. Status defaults to NO GO (the same safe default used for an
+    # unrecognized Status line), so set GO only after confirming "passes all
+    # tests" on the plan sheet. Entries are kept across reruns.
+    with st.expander("Manual entry (optional)", expanded=True):
+        st.caption(
+            "Add a row for any file the app cannot read. Pick the file, then "
+            "enter the designer's name, cost, and structural status. A manual "
+            "row replaces anything the app reads from that file. Rows with a "
+            "blank cost are ignored. Manual rows are marked \"manually "
+            "entered\" in the Notes column of both CSVs."
+        )
+        manual_df = st.data_editor(
+            pd.DataFrame(
+                {
+                    "Source File": pd.Series(dtype="object"),
+                    "Name": pd.Series(dtype="object"),
+                    "Cost": pd.Series(dtype="float64"),
+                    "Structural Status": pd.Series(dtype="object"),
+                    "Notes": pd.Series(dtype="object"),
+                }
+            ),
+            key="manual_entry_editor",
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Source File": st.column_config.SelectboxColumn(
+                    "Source File", options=[f.name for f in uploaded_files]
+                ),
+                "Name": st.column_config.TextColumn("Name"),
+                "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="$%.2f"),
+                "Structural Status": st.column_config.SelectboxColumn(
+                    "Structural Status", options=["GO", "NO GO"], default="NO GO"
+                ),
+                "Notes": st.column_config.TextColumn("Notes (optional)"),
+            },
+        )
+
+    # Convert valid manual rows to records, keyed by file. If the same file
+    # is entered twice, the later row wins.
+    uploaded_names = {f.name for f in uploaded_files}
+    manual_by_file = {}
+    for _, row in manual_df.iterrows():
+        file_name = row["Source File"]
+        if pd.isna(file_name) or file_name not in uploaded_names or pd.isna(row["Cost"]):
+            continue
+        name = "" if pd.isna(row["Name"]) else str(row["Name"]).strip()
+        user_note = "" if pd.isna(row["Notes"]) else str(row["Notes"]).strip()
+        status = row["Structural Status"] if row["Structural Status"] in ("GO", "NO GO") else "NO GO"
+        manual_by_file[file_name] = {
+            "file": file_name,
+            "name": name or "Unknown",
+            "cost": float(row["Cost"]),
+            "status": status,
+            "note": "manually entered" + (f"; {user_note}" if user_note else ""),
+        }
+
     if st.button("Check and grade submissions", type="primary"):
-        go_records = []
-        no_go_records = []
         unparsed = []
         # Files pdfplumber cannot open at all (corrupt, empty, encrypted, or
         # not actually a PDF). Kept separate from "unparsed" so the grader can
@@ -357,6 +427,51 @@ if uploaded_files:
             else:
                 parsed.append(rec)
 
+        # Store extraction results so they survive reruns. Everything below
+        # is recomputed from these on every rerun, so manual entries and the
+        # sensitivity setting take effect without re-reading the PDFs.
+        st.session_state["extraction"] = {
+            "sig": file_sig,
+            "parsed": parsed,
+            "unparsed": unparsed,
+            "unreadable": unreadable,
+        }
+
+    # -----------------------------------------------------------------------
+    # Merge manual entries, deduplicate, build OML, grade
+    # -----------------------------------------------------------------------
+
+    if "extraction" in st.session_state:
+        extraction = st.session_state["extraction"]
+
+        # Files with a manual row are taken from the manual table only, so
+        # they drop out of the extracted lists and the warnings below.
+        unparsed = [n for n in extraction["unparsed"] if n not in manual_by_file]
+        unreadable = [(n, why) for n, why in extraction["unreadable"] if n not in manual_by_file]
+
+        # Copies, so grade() adding rank/grade keys never alters the stored
+        # extraction between reruns.
+        parsed = [dict(r) for r in extraction["parsed"] if r["file"] not in manual_by_file]
+        parsed += [dict(r) for r in manual_by_file.values()]
+
+        go_records = []
+        no_go_records = []
+
+        if unreadable:
+            st.error(
+                "The following file(s) could not be opened as PDFs and are "
+                "excluded. Re-upload a valid PDF, or add a row for each in "
+                "Manual entry above:\n"
+                + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
+            )
+
+        if unparsed:
+            st.warning(
+                "Could not find a cost on the following file(s); they are "
+                "excluded unless you add a row for each in Manual entry above:\n"
+                + "\n".join(f"- {name}" for name in unparsed)
+            )
+
         # Keep one submission per designer name before splitting GO/NO GO,
         # so duplicates never reach grading, the OML, or either CSV.
         parsed, duplicates = dedupe_by_name(parsed)
@@ -366,20 +481,6 @@ if uploaded_files:
                 go_records.append(rec)
             else:
                 no_go_records.append(rec)
-
-        if unreadable:
-            st.error(
-                "The following file(s) could not be opened as PDFs and are "
-                "excluded entirely. Check that each is a valid, unencrypted PDF "
-                "and re-upload it:\n"
-                + "\n".join(f"- {name} ({reason})" for name, reason in unreadable)
-            )
-
-        if unparsed:
-            st.warning(
-                "Could not find a cost on the following file(s); they are "
-                "excluded entirely:\n" + "\n".join(f"- {name}" for name in unparsed)
-            )
 
         if duplicates:
             # "\\$" escapes the dollar sign so Streamlit does not render the
@@ -430,7 +531,9 @@ if uploaded_files:
                         "Cost": r["cost"],
                         "Recommended Grade": r["grade"],
                         "Structural Status": "GO",
-                        "Notes": "",
+                        # Empty for PDF-parsed GO submissions; "manually
+                        # entered" for rows from the manual entry table.
+                        "Notes": r["note"],
                         "Source File": r["file"],
                     }
                 )
@@ -450,6 +553,10 @@ if uploaded_files:
             results_df = pd.DataFrame(rows)
             results_df["Rank"] = results_df["Rank"].astype("Int64")
             st.session_state["results_df"] = results_df
+else:
+    # Uploader cleared: drop results from the previous batch.
+    for key in ("extraction", "results_df", "oml_df"):
+        st.session_state.pop(key, None)
 
 # ---------------------------------------------------------------------------
 # Results
