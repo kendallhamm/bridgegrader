@@ -376,6 +376,9 @@ def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], ful
                     "Rank": r["rank"],
                     "Name": r["name"],
                     "Cost": r["cost"],
+                    # Informational only; used by the Rank vs. Iterations
+                    # chart. .get() so records without the key still work.
+                    "Iterations": r.get("iterations"),
                     "Recommended Grade": r["grade"],
                     "Structural Status": "GO",
                     # Empty for PDF-parsed GO submissions; "manually
@@ -390,6 +393,7 @@ def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], ful
                     "Rank": None,
                     "Name": r["name"],
                     "Cost": r["cost"],
+                    "Iterations": r.get("iterations"),
                     "Recommended Grade": None,
                     "Structural Status": "NO GO",
                     "Notes": r["note"],
@@ -399,6 +403,8 @@ def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], ful
 
         results_df = pd.DataFrame(rows)
         results_df["Rank"] = results_df["Rank"].astype("Int64")
+        # Nullable integer type, same as the OML: no ".0", blanks stay blank.
+        results_df["Iterations"] = results_df["Iterations"].astype("Int64")
         st.session_state["results_df"] = results_df
 
 
@@ -980,6 +986,92 @@ if "results_df" in st.session_state:
                 f"PNG export unavailable ({e}). Make sure vl-convert-python "
                 "is installed (see requirements.txt)."
             )
+
+        # -------------------------------------------------------------------
+        # Rank vs. Iterations (black and white, no grade color scale)
+        # -------------------------------------------------------------------
+        # Only GO submissions have a rank, so only they are plotted. Rows
+        # with no iteration count cannot be placed on the y axis; they are
+        # dropped from this chart only and listed below it, not hidden.
+        iter_df = graded_df.dropna(subset=["Iterations"]).copy()
+        missing_iter = graded_df[graded_df["Iterations"].isna()]
+        # Plain int64 for Altair (nullable Int64 is not needed after dropna).
+        iter_df["Iterations"] = iter_df["Iterations"].astype("int64")
+        iter_df["Rank"] = iter_df["Rank"].astype("int64")
+
+        st.subheader("Rank vs. Iterations (qualifying submissions)")
+        st.caption(
+            "Rank 1 (cheapest) is on the left. This view shows whether "
+            "students who iterated more on their design ended up with "
+            "cheaper bridges. Iteration count is informational only and "
+            "does not affect rank or grade. Disqualified (NO GO) "
+            "submissions are not plotted."
+        )
+
+        if iter_df.empty:
+            st.info("No qualifying submission has an iteration count, so this chart cannot be drawn.")
+        else:
+            iter_chart = (
+                alt.Chart(iter_df)
+                # Fixed black points: no color encoding, so no legend.
+                .mark_circle(size=110, color="black", opacity=1)
+                .encode(
+                    x=alt.X(
+                        "Rank:O",
+                        title="Rank",
+                        sort=alt.SortField(field="Rank", order="ascending"),
+                        axis=alt.Axis(labelAngle=0),
+                    ),
+                    y=alt.Y("Iterations:Q", title="Iteration Count", scale=alt.Scale(zero=True)),
+                    tooltip=[
+                        "Rank",
+                        "Name",
+                        "Iterations",
+                        alt.Tooltip("Cost:Q", format="$,.2f"),
+                        "Recommended Grade",
+                    ],
+                )
+                .properties(height=420)
+                .interactive()
+                # White background and black axes so the chart stays black
+                # and white in both Streamlit light and dark modes and in
+                # the PNG export. Gridlines are light gray for readability.
+                .configure(background="white")
+                .configure_view(stroke="black")
+                .configure_axis(
+                    domainColor="black",
+                    tickColor="black",
+                    labelColor="black",
+                    titleColor="black",
+                    gridColor="#d9d9d9",
+                )
+            )
+            # theme=None stops Streamlit from overriding the colors above.
+            st.altair_chart(iter_chart, use_container_width=True, theme=None)
+
+            if not missing_iter.empty:
+                st.caption(
+                    f"{len(missing_iter)} qualifying submission(s) have no iteration "
+                    "count and are not plotted: "
+                    + ", ".join(f"Rank {int(r['Rank'])} ({r['Name']})" for _, r in missing_iter.iterrows())
+                )
+
+            try:
+                png_buf = io.BytesIO()
+                iter_chart.save(png_buf, format="png", scale_factor=2)
+                iter_chart_png = png_buf.getvalue()
+                st.download_button(
+                    "Download this chart as PNG",
+                    data=iter_chart_png,
+                    file_name="rank_vs_iterations.png",
+                    mime="image/png",
+                    key="download_iter_chart_png",
+                )
+            except Exception as e:
+                st.caption(
+                    f"PNG export unavailable ({e}). Make sure vl-convert-python "
+                    "is installed (see requirements.txt)."
+                )
 
 # ---------------------------------------------------------------------------
 # Order of merit list (shown independently of grading)
