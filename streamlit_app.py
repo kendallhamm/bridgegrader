@@ -254,7 +254,11 @@ def dedupe_by_name(records: list[dict]):
 # Grading
 # ---------------------------------------------------------------------------
 
-def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
+GRADE_CEILING_RANK4 = 96.0  # grade for a bid priced exactly at the 3rd-cheapest cost
+DEFAULT_GRADE_FLOOR = 80.0
+
+
+def grade(records: list[dict], full_penalty_pct: float = 20.0, floor: float = DEFAULT_GRADE_FLOOR) -> list[dict]:
     """Sort ascending by cost and assign grades to GO (qualifying) submissions.
 
     Rank 1 (cheapest):  100
@@ -262,22 +266,27 @@ def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
     Ranks 4-N: graded on how much more expensive the bid is than the
                3rd-cheapest (c3), as a percentage, not on where it falls
                in the batch's min-max range. This avoids stretching a
-               tightly clustered batch across the full 96-80 point range
-               just because someone has to be "most expensive."
+               tightly clustered batch across the full 96-to-floor point
+               range just because someone has to be "most expensive."
 
         premium_pct = (cost - c3) / c3 * 100
-        grade = 96 - min(premium_pct / full_penalty_pct, 1.0) * (96 - 80)
+        grade = 96 - min(premium_pct / full_penalty_pct, 1.0) * (96 - floor)
 
     A bid priced at c3 scores 96. A bid priced full_penalty_pct percent
-    (or more) above c3 scores the floor of 80. Bids in between scale
-    linearly. If the batch's actual spread never reaches full_penalty_pct,
-    nobody hits 80 — scores stay clustered near 96, proportional to how
-    close costs actually are.
+    (or more) above c3 scores the floor (default 80). Bids in between
+    scale linearly. If the batch's actual spread never reaches
+    full_penalty_pct, nobody hits the floor — scores stay clustered near
+    96, proportional to how close costs actually are.
+
+    The floor must be from 0 up to 96. A floor above 96 would let a
+    rank-4 bid outscore ranks 2-3.
     """
     if len(records) < 3:
         raise ValueError("Need at least 3 qualifying submissions to grade (top-3 tiers require 3).")
     if full_penalty_pct <= 0:
         raise ValueError("full_penalty_pct must be greater than 0.")
+    if not 0 <= floor <= GRADE_CEILING_RANK4:
+        raise ValueError(f"floor must be between 0 and {GRADE_CEILING_RANK4:g}.")
 
     records = sorted(records, key=lambda r: r["cost"])
     c3 = records[2]["cost"]
@@ -289,11 +298,11 @@ def grade(records: list[dict], full_penalty_pct: float = 20.0) -> list[dict]:
         elif i in (2, 3):
             r["grade"] = 97.0
         elif c3 == 0:
-            r["grade"] = 80.0  # degenerate case: can't compute a percentage premium over $0
+            r["grade"] = float(floor)  # degenerate case: can't compute a percentage premium over $0
         else:
             premium_pct = (r["cost"] - c3) / c3 * 100.0
             fraction = min(max(premium_pct / full_penalty_pct, 0.0), 1.0)
-            r["grade"] = round(96.0 - fraction * (96.0 - 80.0), 2)
+            r["grade"] = round(GRADE_CEILING_RANK4 - fraction * (GRADE_CEILING_RANK4 - floor), 2)
 
     return records
 
@@ -340,7 +349,12 @@ def build_oml(go_records: list[dict], no_go_records: list[dict]) -> list[dict]:
 # Results assembly (shared by the PDF mode and the saved-OML mode)
 # ---------------------------------------------------------------------------
 
-def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], full_penalty_pct: float) -> None:
+def build_oml_and_results(
+    go_records: list[dict],
+    no_go_records: list[dict],
+    full_penalty_pct: float,
+    grade_floor: float = DEFAULT_GRADE_FLOOR,
+) -> None:
     """Build the OML and the graded results table and store both in
     st.session_state ("oml_df", "results_df"). Shows the fewer-than-3-GO
     error when grading is not possible. Used by both input modes so they
@@ -367,7 +381,7 @@ def build_oml_and_results(go_records: list[dict], no_go_records: list[dict], ful
             st.info("The order of merit list is still produced below.")
         st.session_state.pop("results_df", None)
     else:
-        graded = grade(go_records, full_penalty_pct=full_penalty_pct)
+        graded = grade(go_records, full_penalty_pct=full_penalty_pct, floor=grade_floor)
 
         rows = []
         for r in graded:
@@ -548,7 +562,7 @@ a warning and excluded from all results.
 |---|---|
 | 1st cheapest | 100 |
 | 2nd & 3rd cheapest | 97 |
-| 4th cheapest ... most expensive | 96 down to 80, scaled by % more expensive than the 3rd-cheapest bid (not by min-max stretch) — see "Grading sensitivity" below |
+| 4th cheapest ... most expensive | 96 down to the grade floor (default 80), scaled by % more expensive than the 3rd-cheapest bid (not by min-max stretch) — see "Grading sensitivity" below |
 """
 )
 
@@ -558,15 +572,27 @@ with st.expander("Grading sensitivity (advanced)"):
     st.caption(
         "Controls how quickly cost above the 3rd-cheapest bid costs grade "
         "points. A bid priced at the 3rd-cheapest cost scores 96; a bid "
-        "priced this percentage (or more) above it scores the floor of 80. "
+        "priced this percentage (or more) above it scores the grade floor. "
         "If your batch's actual cost spread never reaches this percentage, "
-        "nobody hits 80. Scores stay clustered near 96, proportional to "
-        "how close costs actually are. Increase this if scores are "
+        "nobody hits the floor. Scores stay clustered near 96, proportional "
+        "to how close costs actually are. Increase this if scores are "
         "spreading too widely for tightly clustered costs; decrease it if "
         "you want cost differences to matter more."
     )
+    # The floor is the lowest grade a GO submission can receive. It is
+    # capped at 96 so a rank-4 bid can never outscore ranks 2-3 (97).
+    grade_floor = st.number_input(
+        "Grade floor (lowest grade for a qualifying submission)",
+        min_value=0.0,
+        max_value=GRADE_CEILING_RANK4,
+        value=DEFAULT_GRADE_FLOOR,
+        step=1.0,
+    )
     full_penalty_pct = st.number_input(
-        "Cost premium (%) above 3rd-cheapest that earns the grade floor of 80",
+        # Static label on purpose: Streamlit ties widget identity to the
+        # label, so a label that changed with the floor would reset this
+        # value every time the floor was edited.
+        "Cost premium (%) above 3rd-cheapest that earns the grade floor",
         min_value=0.1,
         value=20.0,
         step=1.0,
@@ -630,14 +656,16 @@ if input_mode == MODE_PDF:
         # Identifies the current upload set. If files are added or removed, or the
         # sensitivity setting changes, after grading, the stored results no longer
         # match the inputs and are discarded so stale grades are never shown.
+        # The grade floor is part of this check for the same reason.
         file_sig = tuple((f.name, f.size) for f in uploaded_files)
+        current_inputs = {"sig": file_sig, "penalty": full_penalty_pct, "floor": grade_floor}
         graded_with = st.session_state.get("graded_with")
-        if graded_with is not None and graded_with != {"sig": file_sig, "penalty": full_penalty_pct}:
+        if graded_with is not None and graded_with != current_inputs:
             for key in ("graded_with", "results_df", "oml_df"):
                 st.session_state.pop(key, None)
             st.info(
-                "The uploaded files or the grading sensitivity changed. Click "
-                "**Check and grade submissions** again."
+                "The uploaded files, the grading sensitivity, or the grade floor "
+                "changed. Click **Check and grade submissions** again."
             )
 
         # -----------------------------------------------------------------------
@@ -800,9 +828,9 @@ if input_mode == MODE_PDF:
                 )
 
             # Record what these results were computed from, for the stale check.
-            st.session_state["graded_with"] = {"sig": file_sig, "penalty": full_penalty_pct}
+            st.session_state["graded_with"] = current_inputs
 
-            build_oml_and_results(go_records, no_go_records, full_penalty_pct)
+            build_oml_and_results(go_records, no_go_records, full_penalty_pct, grade_floor)
     else:
         # Uploader cleared: drop results from the previous batch.
         for key in ("graded_with", "results_df", "oml_df"):
@@ -859,10 +887,11 @@ else:
             st.write(
                 f"Loaded {len(oml_records)} submission(s) from {oml_file.name}: "
                 f"{len(go_records)} GO, {len(no_go_records)} NO GO. "
-                f"Grading with a {full_penalty_pct:g}% sensitivity."
+                f"Grading with a {full_penalty_pct:g}% sensitivity and a "
+                f"grade floor of {grade_floor:g}."
             )
 
-            build_oml_and_results(go_records, no_go_records, full_penalty_pct)
+            build_oml_and_results(go_records, no_go_records, full_penalty_pct, grade_floor)
 
 # ---------------------------------------------------------------------------
 # Results
@@ -888,6 +917,12 @@ if "results_df" in st.session_state:
     )
 
     if not graded_df.empty:
+        # Chart scales follow the grade floor so the full grade range is
+        # visible and the color gradient spans floor (red) to 100 (green).
+        # The stale check above guarantees these results used this floor.
+        grade_axis_domain = [grade_floor - 2, 101]
+        grade_color_domain = [grade_floor, 100]
+
         st.subheader("Cost vs. Grade (qualifying submissions)")
         st.caption(
             "Grading is a "
@@ -906,11 +941,11 @@ if "results_df" in st.session_state:
                 y=alt.Y(
                     "Recommended Grade:Q",
                     title="Recommended Grade",
-                    scale=alt.Scale(domain=[78, 101]),
+                    scale=alt.Scale(domain=grade_axis_domain),
                 ),
                 color=alt.Color(
                     "Recommended Grade:Q",
-                    scale=alt.Scale(scheme="redyellowgreen", domain=[80, 100]),
+                    scale=alt.Scale(scheme="redyellowgreen", domain=grade_color_domain),
                     legend=alt.Legend(title="Grade"),
                 ),
                 tooltip=["Rank", "Name", alt.Tooltip("Cost:Q", format="$,.2f"), "Recommended Grade"],
@@ -960,7 +995,7 @@ if "results_df" in st.session_state:
                 ),
                 color=alt.Color(
                     "Recommended Grade:Q",
-                    scale=alt.Scale(scheme="redyellowgreen", domain=[80, 100]),
+                    scale=alt.Scale(scheme="redyellowgreen", domain=grade_color_domain),
                     legend=alt.Legend(title="Grade"),
                 ),
                 tooltip=["Rank", "Name", alt.Tooltip("Cost:Q", format="$,.2f"), "Recommended Grade"],
